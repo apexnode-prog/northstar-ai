@@ -12,13 +12,15 @@ import json
 import random
 import re
 import threading
+import hmac
+import os
 
 HOST = "127.0.0.1"
 PORT = 8080
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 ROOT = Path(__file__).resolve().parent
 BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
-ADMIN_CODE = "apexnode-prog_admin"
+ADMIN_CODE = os.environ.get("NORTHSTAR_ADMIN_CODE", "apexnode-prog_admin")
 REDEEMED_TXIDS = ROOT / "redeemed_txids.json"
 REDEEM_LOCK = threading.Lock()
 
@@ -162,7 +164,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/verify-btc":
             submitted_txid = str(payload.get("txid", "")).strip()
             submitted_code = str(payload.get("code", "")).strip()
-            if ADMIN_CODE in (submitted_txid, submitted_code):
+            if any(hmac.compare_digest(candidate, ADMIN_CODE)
+                   for candidate in (submitted_txid, submitted_code) if candidate):
                 self._json(200, {"verified": True, "admin": True})
                 return
             txid = (submitted_txid or submitted_code).lower()
@@ -202,23 +205,40 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             if not prompt:
                 self._json(400, {"error": "A non-empty prompt is required."})
                 return
-            image_url = (
-                "https://pollinations.ai/" + quote(prompt, safe="")
-                + f"?width=512&height=512&nologo=true&seed={random.randrange(1, 2**31)}"
-            )
+            provider_url = "https://pollinations.ai/" + quote(prompt, safe="")
+            attempts = [
+                f"{provider_url}?width=768&height=768&nologo=true&seed={random.randrange(1, 2**31)}",
+                f"{provider_url}?width=768&height=768&nologo=true&seed={random.randrange(1, 2**31)}",
+            ]
+            failures = []
+            image_bytes = None
+            content_type = ""
+            for image_url in attempts:
+                try:
+                    image_request = Request(
+                        image_url,
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; Northstar/1.0)"},
+                    )
+                    with urlopen(image_request, timeout=30) as response:
+                        candidate = response.read()
+                        candidate_type = response.headers.get_content_type().lower()
+                    if not candidate_type.startswith("image/") or len(candidate) <= 2048:
+                        raise ValueError("Provider returned an invalid or incomplete image.")
+                    image_bytes, content_type = candidate, candidate_type
+                    break
+                except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+                    failures.append(str(exc))
+            if image_bytes is None:
+                self._json(502, {"error": "Could not generate image: " + "; ".join(failures)})
+                return
+            generated_dir = ROOT / "generated"
             try:
-                image_request = Request(image_url, headers={"User-Agent": "Northstar/1.0"})
-                with urlopen(image_request, timeout=180) as response:
-                    image_bytes = response.read()
-                    content_type = response.headers.get_content_type()
-                if not image_bytes or not content_type.startswith("image/"):
-                    raise ValueError("Image provider returned an empty or non-image response.")
-                generated_dir = ROOT / "generated"
                 generated_dir.mkdir(parents=True, exist_ok=True)
-                filename = f"{random.randrange(1, 2**63):016x}.jpg"
+                extension = ".png" if content_type == "image/png" else ".jpg"
+                filename = f"{random.randrange(1, 2**63):016x}{extension}"
                 (generated_dir / filename).write_bytes(image_bytes)
-            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-                self._json(502, {"error": f"Could not generate image: {exc}"})
+            except OSError as exc:
+                self._json(500, {"error": f"Could not save generated image: {exc}"})
                 return
             self._json(200, {"url": f"/generated/{filename}"})
             return
