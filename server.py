@@ -13,14 +13,13 @@ import random
 import re
 import threading
 import hmac
-import os
 
 HOST = "127.0.0.1"
 PORT = 8080
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 ROOT = Path(__file__).resolve().parent
 BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
-ADMIN_CODE = os.environ.get("NORTHSTAR_ADMIN_CODE", "apexnode-prog_admin")
+ADMIN_CODE = "apexnode-prog_admin"
 REDEEMED_TXIDS = ROOT / "redeemed_txids.json"
 REDEEM_LOCK = threading.Lock()
 
