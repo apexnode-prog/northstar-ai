@@ -11,11 +11,29 @@ import zlib
 import json
 import random
 import re
+import threading
 
 HOST = "127.0.0.1"
 PORT = 8080
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 ROOT = Path(__file__).resolve().parent
+BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
+REDEEMED_TXIDS = ROOT / "redeemed_txids.json"
+REDEEM_LOCK = threading.Lock()
+
+
+def btc_usd_price():
+    request = Request("https://mempool.space/api/v1/prices", headers={"User-Agent": "Northstar/1.0"})
+    with urlopen(request, timeout=15) as response:
+        return float(json.loads(response.read())["USD"])
+
+
+def load_redeemed():
+    try:
+        values = json.loads(REDEEMED_TXIDS.read_text("utf-8"))
+        return set(values if isinstance(values, list) else [])
+    except (OSError, json.JSONDecodeError):
+        return set()
 
 
 class SearchParser(HTMLParser):
@@ -138,6 +156,39 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length) or b"{}")
         except (json.JSONDecodeError, ValueError):
             self._json(400, {"error": "Request body must be valid JSON."})
+            return
+
+        if self.path == "/api/verify-btc":
+            txid = str(payload.get("txid", "")).strip().lower()
+            try:
+                price = btc_usd_price()
+                quote_btc = 2.0 / price
+                if not txid:
+                    self._json(200, {"price_usd": price, "btc_due": quote_btc, "address": BTC_ADDRESS})
+                    return
+                if not re.fullmatch(r"[0-9a-f]{64}", txid):
+                    self._json(400, {"verified": False, "error": "Enter a valid 64-character Bitcoin transaction ID."})
+                    return
+                with REDEEM_LOCK:
+                    used = load_redeemed()
+                    if txid in used:
+                        self._json(200, {"verified": False, "error": "This transaction ID has already been redeemed."})
+                        return
+                    tx_request = Request(f"https://mempool.space/api/tx/{txid}", headers={"User-Agent": "Northstar/1.0"})
+                    with urlopen(tx_request, timeout=20) as response:
+                        transaction = json.loads(response.read())
+                    received = sum(int(output.get("value", 0)) for output in transaction.get("vout", [])
+                                   if output.get("scriptpubkey_address") == BTC_ADDRESS)
+                    if received * price / 100_000_000 < 1.90:
+                        self._json(200, {"verified": False, "error": "This transaction does not show at least $1.90 USD sent to the access address."})
+                        return
+                    used.add(txid)
+                    REDEEMED_TXIDS.write_text(json.dumps(sorted(used), indent=2) + "\n", encoding="utf-8")
+                self._json(200, {"verified": True})
+            except HTTPError as exc:
+                self._json(502 if exc.code >= 500 else 400, {"verified": False, "error": "The Bitcoin explorer could not find or verify that transaction."})
+            except (URLError, TimeoutError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                self._json(502, {"verified": False, "error": f"Could not verify payment right now: {exc}"})
             return
 
         if self.path == "/api/image":
