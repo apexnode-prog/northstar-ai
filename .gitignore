@@ -1,3 +1,5 @@
+work/
 generated/
 *.log
+*.bak
 .DS_Store
