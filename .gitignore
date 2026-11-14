@@ -3,3 +3,4 @@ generated/
 *.log
 *.bak
 .DS_Store
+redeemed_txids.json
