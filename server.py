@@ -5,6 +5,9 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from urllib.parse import urlencode
+from html.parser import HTMLParser
+import zlib
 import json
 import random
 import re
@@ -13,6 +16,84 @@ HOST = "127.0.0.1"
 PORT = 8080
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 ROOT = Path(__file__).resolve().parent
+
+
+class SearchParser(HTMLParser):
+    """Extract DuckDuckGo result blocks without external dependencies."""
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self.current = None
+        self.capture = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = attrs.get("class", "")
+        if tag == "a" and ("result__a" in classes or "result-link" in classes):
+            self.current = {"title": "", "url": attrs.get("href", ""), "snippet": ""}
+            self.capture = ("title", 1)
+        elif self.current and ("result__snippet" in classes or "result-snippet" in classes):
+            self.capture = ("snippet", 1)
+        elif self.capture:
+            self.capture = (self.capture[0], self.capture[1] + 1)
+
+    def handle_data(self, data):
+        if self.current and self.capture:
+            key, _ = self.capture
+            self.current[key] += data
+
+    def handle_endtag(self, tag):
+        if self.capture and tag == "a" and self.capture[0] == "title":
+            self.capture = None
+        if self.current and self.current.get("title", "").strip() and self.current.get("snippet", "").strip():
+            self.current = {k: v.strip() for k, v in self.current.items()}
+            self.results.append(self.current)
+            self.current = None
+            self.capture = None
+
+
+def web_search(query):
+    url = "https://html.duckduckgo.com/html/?" + urlencode({"q": query})
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Northstar/1.0)"})
+    with urlopen(req, timeout=15) as response:
+        html = response.read().decode("utf-8", "replace")
+    parser = SearchParser()
+    parser.feed(html)
+    return parser.results[:5]
+
+
+def extract_pdf(data):
+    try:
+        from pypdf import PdfReader
+        import io
+        return "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(data)).pages)
+    except ImportError:
+        pass
+    try:
+        import fitz
+        doc = fitz.open(stream=data, filetype="pdf")
+        return "\n".join(page.get_text() for page in doc)
+    except ImportError:
+        pass
+    chunks = [data]
+    for match in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", data, re.S):
+        raw = match.group(1)
+        try:
+            chunks.append(zlib.decompress(raw))
+        except zlib.error:
+            chunks.append(raw)
+    extracted = []
+    for chunk in chunks:
+        for raw in re.findall(rb"\((?:\\.|[^\\)])*\)\s*(?:Tj|'|\")", chunk):
+            text = raw[1:raw.rfind(b")")]
+            text = re.sub(rb"\\([()\\])", rb"\1", text)
+            extracted.append(text.decode("utf-8", "ignore"))
+        for raw in re.findall(rb"<([0-9A-Fa-f]{4,})>\s*Tj", chunk):
+            try:
+                extracted.append(bytes.fromhex(raw.decode()).decode("utf-16-be", "ignore"))
+            except ValueError:
+                pass
+    return "\n".join(extracted)
 
 
 class NorthstarHandler(SimpleHTTPRequestHandler):
@@ -85,6 +166,16 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             self._json(200, {"url": f"/generated/{filename}"})
             return
 
+        if self.path == "/api/extract":
+            try:
+                import base64
+                raw = base64.b64decode(payload.get("data", ""), validate=False)
+                text = extract_pdf(raw)
+                self._json(200, {"text": text[:200000]})
+            except Exception as exc:
+                self._json(400, {"error": f"Could not extract PDF text: {exc}"})
+            return
+
         if self.path != "/api/chat":
             self._json(404, {"error": "Not found"})
             return
@@ -93,6 +184,22 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         # the JSON request and relay its NDJSON stream without buffering it.
         try:
             messages = payload.get("messages", [])
+            if payload.get("web_search"):
+                query = str(payload.get("search_query", "")).strip()
+                if not query:
+                    query = next((str(m.get("content", "")) for m in reversed(messages)
+                                  if m.get("role") == "user"), "")
+                try:
+                    results = web_search(query) if query else []
+                    context = "Web search results (verify details; cite the URLs when useful):\n" + "\n".join(
+                        f"{i+1}. {r['title']}\nURL: {r['url']}\n{r['snippet']}" for i, r in enumerate(results)
+                    )
+                except (HTTPError, URLError, TimeoutError, OSError):
+                    context = "Live web search was unavailable for this request."
+                if messages and messages[0].get("role") == "system":
+                    messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + context
+                else:
+                    messages.insert(0, {"role": "system", "content": context})
             has_images = False
             data_image = re.compile(r"^data:image/[^;,]+;base64,(.*)$", re.DOTALL)
             for message in messages:
