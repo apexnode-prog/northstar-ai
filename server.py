@@ -13,8 +13,8 @@ import random
 import re
 import threading
 import hmac
-import mimetypes
 import ipaddress
+import subprocess
 
 HOST = "127.0.0.1"
 PORT = 8080
@@ -57,6 +57,32 @@ def save_ip_usage(values):
     temporary = IP_USAGE.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(values, indent=2) + "\n", encoding="utf-8")
     temporary.replace(IP_USAGE)
+
+
+def curl_download(url, output_path):
+    result = subprocess.run(
+        ["curl", "-fsSL", "--max-time", "25", "-A", "Mozilla/5.0", "-o", str(output_path), url],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"curl exited with status {result.returncode}")
+
+
+def valid_image_file(path):
+    try:
+        if path.stat().st_size <= 2048:
+            return None
+        with path.open("rb") as image_file:
+            signature = image_file.read(8)
+        if signature.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if signature.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+    except OSError:
+        pass
+    return None
 
 
 class SearchParser(HTMLParser):
@@ -271,83 +297,107 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             if not prompt:
                 self._json(400, {"error": "A non-empty prompt is required."})
                 return
-            failures = []
-            image_bytes = None
-            content_type = ""
+            generated_dir = ROOT / "generated"
+            try:
+                generated_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._json(500, {"error": f"Could not create generated image folder: {exc}"})
+                return
 
-            def download_image(image_url):
-                request = Request(
-                    image_url,
-                    headers={"User-Agent": "Mozilla/5.0 (compatible; Northstar/1.0)"},
-                )
-                with urlopen(request, timeout=30) as response:
-                    content = response.read()
-                    media_type = response.headers.get_content_type().lower()
-                if not media_type.startswith("image/") or len(content) <= 2048:
-                    raise ValueError("Provider returned an invalid or incomplete image.")
-                return content, media_type
+            # Give short, subject-free image requests a clear educational topic.
+            vague_prompt = re.fullmatch(
+                r"(?:please\s+)?(?:draw|generate|create|make|paint|illustrate|show\s+me|give\s+me|i\s+want\s+(?:to\s+see)?)\s*"
+                r"(?:(?:me|a|an|some|the)\s+)*(?:picture|image|diagram|drawing|photo|illustration)?\s*(?:please)?[.!?]*",
+                prompt.lower(),
+            )
+            if vague_prompt:
+                prompt = "colorful educational landscape illustration"
 
             encoded_prompt = quote(prompt, safe="")
-            pollinations_urls = (
-                f"https://gen.pollinations.ai/image/{encoded_prompt}?width=768&height=768&nologo=true&seed={random.randrange(1, 2**31)}",
-                f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=768&height=768&nologo=true&seed={random.randrange(1, 2**31)}",
+            seed_one = random.randrange(1, 2**31)
+            seed_two = random.randrange(1, 2**31)
+            image_urls = (
+                f"https://pollinations.ai/{encoded_prompt}?width=768&height=768&nologo=true&seed={seed_one}",
+                f"https://pollinations.ai/{encoded_prompt}?width=768&height=768&nologo=true&seed={seed_two}",
             )
-            for image_url in pollinations_urls:
-                try:
-                    image_bytes, content_type = download_image(image_url)
-                    break
-                except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-                    failures.append(str(exc))
+            output_path = generated_dir / f"{random.randrange(1, 2**63):016x}.jpg"
+            failures = []
+            content_type = None
 
-            if image_bytes is None:
+            for image_url in image_urls:
+                try:
+                    curl_download(image_url, output_path)
+                    content_type = valid_image_file(output_path)
+                    if content_type:
+                        break
+                    failures.append("Pollinations returned a file that is not a valid JPEG or PNG image.")
+                except (OSError, RuntimeError) as exc:
+                    failures.append(str(exc))
+                try:
+                    output_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            if not content_type:
+                search_path = generated_dir / f"{random.randrange(1, 2**63):016x}.search.json"
                 try:
                     search_url = "https://commons.wikimedia.org/w/api.php?" + urlencode({
                         "action": "query",
                         "generator": "search",
-                        "gsrsearch": f"{prompt} filetype:bitmap",
-                        "gsrnamespace": "6",
-                        "gsrlimit": "6",
+                        "gsrsearch": prompt,
+                        "gsrnamespace": 6,
+                        "gsrlimit": 3,
                         "prop": "imageinfo",
                         "iiprop": "url",
-                        "iiurlwidth": "1200",
+                        "iiurlwidth": 800,
                         "format": "json",
                     })
-                    search_request = Request(
-                        search_url,
-                        headers={"User-Agent": "Northstar/1.0 (student image search)"},
-                    )
-                    with urlopen(search_request, timeout=20) as response:
-                        search_result = json.loads(response.read())
+                    curl_download(search_url, search_path)
+                    search_result = json.loads(search_path.read_text("utf-8"))
                     pages = search_result.get("query", {}).get("pages", {})
-                    image_urls = [
-                        (page.get("imageinfo") or [{}])[0].get("thumburl")
-                        or (page.get("imageinfo") or [{}])[0].get("url")
-                        for page in pages.values()
-                    ]
-                    for image_url in image_urls:
+                    for page in pages.values():
+                        info = (page.get("imageinfo") or [{}])[0]
+                        image_url = info.get("thumburl") or info.get("url")
                         if not image_url:
                             continue
                         try:
-                            image_bytes, content_type = download_image(image_url)
-                            break
-                        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+                            curl_download(image_url, output_path)
+                            content_type = valid_image_file(output_path)
+                            if content_type:
+                                break
+                            failures.append("Wikimedia returned a file that is not a valid JPEG or PNG image.")
+                        except (OSError, RuntimeError) as exc:
                             failures.append(str(exc))
-                except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+                        try:
+                            output_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                except (OSError, RuntimeError, json.JSONDecodeError) as exc:
                     failures.append(str(exc))
-            if image_bytes is None:
+                finally:
+                    try:
+                        search_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+            if not content_type:
+                failures.append("Wikimedia Commons did not return a valid downloadable image.")
+                try:
+                    output_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 self._json(502, {"error": "Could not generate image: " + "; ".join(failures)})
                 return
-            generated_dir = ROOT / "generated"
+
+            extension = ".png" if content_type == "image/png" else ".jpg"
+            final_path = output_path.with_suffix(extension)
             try:
-                generated_dir.mkdir(parents=True, exist_ok=True)
-                extension = mimetypes.guess_extension(content_type) or ".jpg"
-                if extension == ".jpe":
-                    extension = ".jpg"
-                filename = f"{random.randrange(1, 2**63):016x}{extension}"
-                (generated_dir / filename).write_bytes(image_bytes)
+                if final_path != output_path:
+                    output_path.replace(final_path)
             except OSError as exc:
                 self._json(500, {"error": f"Could not save generated image: {exc}"})
                 return
+            filename = final_path.name
             self._json(200, {"url": f"/generated/{filename}"})
             return
 
