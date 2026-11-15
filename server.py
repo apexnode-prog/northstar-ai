@@ -13,6 +13,8 @@ import random
 import re
 import threading
 import hmac
+import mimetypes
+import ipaddress
 
 HOST = "127.0.0.1"
 PORT = 8080
@@ -22,6 +24,9 @@ BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
 ADMIN_CODE = "apexnode-prog_admin"
 REDEEMED_TXIDS = ROOT / "redeemed_txids.json"
 REDEEM_LOCK = threading.Lock()
+IP_USAGE = ROOT / "ip_usage.json"
+IP_USAGE_LOCK = threading.Lock()
+FREE_TRIAL_LIMIT = 5
 
 
 def btc_usd_price():
@@ -36,6 +41,22 @@ def load_redeemed():
         return set(values if isinstance(values, list) else [])
     except (OSError, json.JSONDecodeError):
         return set()
+
+
+def load_ip_usage():
+    try:
+        values = json.loads(IP_USAGE.read_text("utf-8"))
+        if not isinstance(values, dict):
+            return {}
+        return {str(ip): max(0, int(count)) for ip, count in values.items()}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def save_ip_usage(values):
+    temporary = IP_USAGE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(values, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(IP_USAGE)
 
 
 class SearchParser(HTMLParser):
@@ -131,7 +152,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, ngrok-skip-browser-warning")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, ngrok-skip-browser-warning, X-Access-Token")
         super().end_headers()
 
     def do_OPTIONS(self):
@@ -143,7 +164,37 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         with urlopen(f"http://127.0.0.1:11434{path}", timeout=10) as response:
             return json.loads(response.read())
 
+    def _visitor_ip(self):
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        candidate = forwarded.split(",", 1)[0].strip() if forwarded else ""
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            return str(self.client_address[0])
+
+    def _has_access_token(self):
+        token = self.headers.get("X-Access-Token", "").strip()
+        if token and hmac.compare_digest(token, ADMIN_CODE):
+            return True
+        if not token:
+            return False
+        with REDEEM_LOCK:
+            redeemed = {str(value).lower() for value in load_redeemed()}
+        return token.lower() in redeemed
+
+    def _trial_snapshot(self, ip):
+        with IP_USAGE_LOCK:
+            used = load_ip_usage().get(ip, 0)
+        return {"used": used, "remaining": max(0, FREE_TRIAL_LIMIT - used)}
+
     def do_GET(self):
+        route = self.path.split("?", 1)[0]
+        if route == "/api/trial-status":
+            ip = self._visitor_ip()
+            snapshot = self._trial_snapshot(ip)
+            snapshot["unlocked"] = self._has_access_token()
+            self._json(200, snapshot)
+            return
         if self.path == "/api/tags":
             try:
                 self._json(200, self._ollama_json("/api/tags"))
@@ -153,6 +204,22 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
+        route = self.path.split("?", 1)[0]
+        if route in ("/api/chat", "/api/image") and not self._has_access_token():
+            ip = self._visitor_ip()
+            with IP_USAGE_LOCK:
+                usage = load_ip_usage()
+                used = usage.get(ip, 0)
+                if used >= FREE_TRIAL_LIMIT:
+                    self._json(402, {"error": "Free trial limit reached", "remaining": 0})
+                    return
+                usage[ip] = used + 1
+                try:
+                    save_ip_usage(usage)
+                except OSError as exc:
+                    self._json(500, {"error": f"Could not record free-trial usage: {exc}"})
+                    return
+
         length = int(self.headers.get("Content-Length", "0"))
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
@@ -160,7 +227,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             self._json(400, {"error": "Request body must be valid JSON."})
             return
 
-        if self.path == "/api/verify-btc":
+        if route == "/api/verify-btc":
             submitted_txid = str(payload.get("txid", "")).strip()
             submitted_code = str(payload.get("code", "")).strip()
             if any(hmac.compare_digest(candidate, ADMIN_CODE)
@@ -199,33 +266,73 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self._json(502, {"verified": False, "error": f"Could not verify payment right now: {exc}"})
             return
 
-        if self.path == "/api/image":
+        if route == "/api/image":
             prompt = str(payload.get("prompt", "")).strip()
             if not prompt:
                 self._json(400, {"error": "A non-empty prompt is required."})
                 return
-            provider_url = "https://pollinations.ai/" + quote(prompt, safe="")
-            attempts = [
-                f"{provider_url}?width=768&height=768&nologo=true&seed={random.randrange(1, 2**31)}",
-                f"{provider_url}?width=768&height=768&nologo=true&seed={random.randrange(1, 2**31)}",
-            ]
             failures = []
             image_bytes = None
             content_type = ""
-            for image_url in attempts:
+
+            def download_image(image_url):
+                request = Request(
+                    image_url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; Northstar/1.0)"},
+                )
+                with urlopen(request, timeout=30) as response:
+                    content = response.read()
+                    media_type = response.headers.get_content_type().lower()
+                if not media_type.startswith("image/") or len(content) <= 2048:
+                    raise ValueError("Provider returned an invalid or incomplete image.")
+                return content, media_type
+
+            encoded_prompt = quote(prompt, safe="")
+            pollinations_urls = (
+                f"https://gen.pollinations.ai/image/{encoded_prompt}?width=768&height=768&nologo=true&seed={random.randrange(1, 2**31)}",
+                f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=768&height=768&nologo=true&seed={random.randrange(1, 2**31)}",
+            )
+            for image_url in pollinations_urls:
                 try:
-                    image_request = Request(
-                        image_url,
-                        headers={"User-Agent": "Mozilla/5.0 (compatible; Northstar/1.0)"},
-                    )
-                    with urlopen(image_request, timeout=30) as response:
-                        candidate = response.read()
-                        candidate_type = response.headers.get_content_type().lower()
-                    if not candidate_type.startswith("image/") or len(candidate) <= 2048:
-                        raise ValueError("Provider returned an invalid or incomplete image.")
-                    image_bytes, content_type = candidate, candidate_type
+                    image_bytes, content_type = download_image(image_url)
                     break
                 except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+                    failures.append(str(exc))
+
+            if image_bytes is None:
+                try:
+                    search_url = "https://commons.wikimedia.org/w/api.php?" + urlencode({
+                        "action": "query",
+                        "generator": "search",
+                        "gsrsearch": f"{prompt} filetype:bitmap",
+                        "gsrnamespace": "6",
+                        "gsrlimit": "6",
+                        "prop": "imageinfo",
+                        "iiprop": "url",
+                        "iiurlwidth": "1200",
+                        "format": "json",
+                    })
+                    search_request = Request(
+                        search_url,
+                        headers={"User-Agent": "Northstar/1.0 (student image search)"},
+                    )
+                    with urlopen(search_request, timeout=20) as response:
+                        search_result = json.loads(response.read())
+                    pages = search_result.get("query", {}).get("pages", {})
+                    image_urls = [
+                        (page.get("imageinfo") or [{}])[0].get("thumburl")
+                        or (page.get("imageinfo") or [{}])[0].get("url")
+                        for page in pages.values()
+                    ]
+                    for image_url in image_urls:
+                        if not image_url:
+                            continue
+                        try:
+                            image_bytes, content_type = download_image(image_url)
+                            break
+                        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+                            failures.append(str(exc))
+                except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
                     failures.append(str(exc))
             if image_bytes is None:
                 self._json(502, {"error": "Could not generate image: " + "; ".join(failures)})
@@ -233,7 +340,9 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             generated_dir = ROOT / "generated"
             try:
                 generated_dir.mkdir(parents=True, exist_ok=True)
-                extension = ".png" if content_type == "image/png" else ".jpg"
+                extension = mimetypes.guess_extension(content_type) or ".jpg"
+                if extension == ".jpe":
+                    extension = ".jpg"
                 filename = f"{random.randrange(1, 2**63):016x}{extension}"
                 (generated_dir / filename).write_bytes(image_bytes)
             except OSError as exc:
@@ -242,7 +351,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             self._json(200, {"url": f"/generated/{filename}"})
             return
 
-        if self.path == "/api/extract":
+        if route == "/api/extract":
             try:
                 import base64
                 raw = base64.b64decode(payload.get("data", ""), validate=False)
@@ -252,7 +361,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self._json(400, {"error": f"Could not extract PDF text: {exc}"})
             return
 
-        if self.path != "/api/chat":
+        if route != "/api/chat":
             self._json(404, {"error": "Not found"})
             return
 

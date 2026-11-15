@@ -5,4 +5,4 @@ generated/
 .DS_Store
 redeemed_txids.json
 ngrok
-ngrok
+ip_usage.json
