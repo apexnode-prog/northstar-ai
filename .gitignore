@@ -4,3 +4,5 @@ generated/
 *.bak
 .DS_Store
 redeemed_txids.json
+ngrok
+ngrok
