@@ -15,6 +15,7 @@ import threading
 import hmac
 import ipaddress
 import subprocess
+import socket
 
 HOST = "127.0.0.1"
 PORT = 8080
@@ -482,17 +483,39 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     self._json(400, {"error": "No local vision model is installed yet. Open Terminal and run: ollama pull moondream"})
                     return
                 payload["model"] = next(m["name"] for m in available if m.get("name", "").lower().startswith(vision))
-            payload["options"] = {**payload.get("options", {}), "num_ctx": 2048, "num_thread": 8}
+            payload["options"] = {
+                **payload.get("options", {}),
+                "num_ctx": 2048,
+                "num_predict": 512,
+                "num_thread": 8,
+            }
             body = json.dumps(payload).encode("utf-8")
             request = Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
-            upstream = urlopen(request, timeout=600)
+            try:
+                upstream = urlopen(request, timeout=45)
+            except (URLError, TimeoutError, socket.timeout) as exc:
+                reason = getattr(exc, "reason", exc)
+                if isinstance(reason, (TimeoutError, socket.timeout)):
+                    self._json(504, {
+                        "error": "Ollama did not start responding within 45 seconds. "
+                                 "Check that Ollama is running and the selected model is available."
+                    })
+                else:
+                    self._json(502, {"error": f"Could not reach Ollama at {OLLAMA_URL}: {exc}"})
+                return
+            # The 45-second limit is only for Ollama's initial response. Once
+            # streaming starts, allow long answers to continue without a socket timeout.
+            try:
+                upstream.fp.raw._sock.settimeout(None)
+            except (AttributeError, OSError):
+                pass
             self.send_response(upstream.status)
             self.send_header("Content-Type", upstream.headers.get("Content-Type", "application/x-ndjson"))
             self.send_header("Cache-Control", "no-cache")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             while True:
-                chunk = upstream.read(8192)
+                chunk = upstream.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -505,7 +528,9 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(detail)))
             self.end_headers()
             self.wfile.write(detail)
-        except (URLError, TimeoutError, BrokenPipeError, ConnectionResetError) as exc:
+        except TimeoutError:
+            return
+        except (URLError, BrokenPipeError, ConnectionResetError) as exc:
             if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
                 return
             self._json(502, {"error": f"Could not reach Ollama at {OLLAMA_URL}: {exc}"})
