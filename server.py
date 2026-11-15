@@ -59,15 +59,40 @@ def save_ip_usage(values):
     temporary.replace(IP_USAGE)
 
 
-def curl_download(url, output_path):
-    result = subprocess.run(
-        ["curl", "-fsSL", "--max-time", "25", "-A", "Mozilla/5.0", "-o", str(output_path), url],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def curl_download(url, output_path, headers=None, post_data_path=None):
+    command = ["curl", "-fsSL", "--max-time", "45", "-A", "Mozilla/5.0"]
+    for header in headers or []:
+        command.extend(["-H", header])
+    if post_data_path:
+        command.extend(["--data-binary", f"@{post_data_path}"])
+    command.extend(["-o", str(output_path), url])
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"curl exited with status {result.returncode}")
+
+
+def clean_image_prompt(value):
+    prompt = re.sub(r"\s+", " ", str(value or "")).strip().strip(".!? ")
+    prefixes = (
+        r"^(?:please\s+)?i\s+(?:would\s+like|want|need)(?:\s+you\s+to)?\s+",
+        r"^(?:can|could|would)\s+you(?:\s+please)?\s+",
+        r"^(?:show\s+me|give\s+me|make(?:\s+me)?|create(?:\s+me)?|generate|draw|illustrate|paint|sketch|visuali[sz]e)\s+",
+        r"^to\s+see\s+",
+    )
+    for _ in range(4):
+        previous = prompt
+        for prefix in prefixes:
+            prompt = re.sub(prefix, "", prompt, flags=re.IGNORECASE)
+        if prompt == previous:
+            break
+    prompt = re.sub(
+        r"^(?:an?\s+)?(?:image|picture|photo|photograph)\s+(?:of|showing|depicting)\s+",
+        "",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    prompt = re.sub(r"^(?:an?|some)\s+", "", prompt, flags=re.IGNORECASE).strip()
+    return prompt
 
 
 def valid_image_file(path):
@@ -293,10 +318,17 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             return
 
         if route == "/api/image":
-            prompt = str(payload.get("prompt", "")).strip()
-            if not prompt:
+            original_prompt = str(payload.get("prompt", "")).strip()
+            if not original_prompt:
                 self._json(400, {"error": "A non-empty prompt is required."})
                 return
+            prompt = clean_image_prompt(original_prompt)
+            if not prompt:
+                prompt = "colorful educational landscape illustration"
+            if not re.search(r"\b(diagram|cartoon|anime|sketch|drawing)\b", original_prompt, re.I):
+                prompt += ", photorealistic, realistic photograph, natural lighting, sharp focus, high detail"
+
+            hf_token = str(payload.get("hf_token", "")).strip()
             generated_dir = ROOT / "generated"
             try:
                 generated_dir.mkdir(parents=True, exist_ok=True)
@@ -304,90 +336,63 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self._json(500, {"error": f"Could not create generated image folder: {exc}"})
                 return
 
-            # Give short, subject-free image requests a clear educational topic.
-            vague_prompt = re.fullmatch(
-                r"(?:please\s+)?(?:draw|generate|create|make|paint|illustrate|show\s+me|give\s+me|i\s+want\s+(?:to\s+see)?)\s*"
-                r"(?:(?:me|a|an|some|the)\s+)*(?:picture|image|diagram|drawing|photo|illustration)?\s*(?:please)?[.!?]*",
-                prompt.lower(),
-            )
-            if vague_prompt:
-                prompt = "colorful educational landscape illustration"
-
-            encoded_prompt = quote(prompt, safe="")
-            seed_one = random.randrange(1, 2**31)
-            seed_two = random.randrange(1, 2**31)
-            image_urls = (
-                f"https://pollinations.ai/{encoded_prompt}?width=768&height=768&nologo=true&seed={seed_one}",
-                f"https://pollinations.ai/{encoded_prompt}?width=768&height=768&nologo=true&seed={seed_two}",
-            )
             output_path = generated_dir / f"{random.randrange(1, 2**63):016x}.jpg"
-            failures = []
             content_type = None
-
-            for image_url in image_urls:
-                try:
-                    curl_download(image_url, output_path)
+            failures = []
+            hf_request_path = None
+            try:
+                if hf_token:
+                    hf_request_path = generated_dir / f"{random.randrange(1, 2**63):016x}.request.json"
+                    hf_request_path.write_text(json.dumps({"inputs": prompt}), encoding="utf-8")
+                    hf_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-dev"
+                    curl_download(
+                        hf_url,
+                        output_path,
+                        headers=[
+                            f"Authorization: Bearer {hf_token}",
+                            "Content-Type: application/json",
+                        ],
+                        post_data_path=hf_request_path,
+                    )
                     content_type = valid_image_file(output_path)
-                    if content_type:
-                        break
-                    failures.append("Pollinations returned a file that is not a valid JPEG or PNG image.")
-                except (OSError, RuntimeError) as exc:
-                    failures.append(str(exc))
-                try:
-                    output_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
-            if not content_type:
-                search_path = generated_dir / f"{random.randrange(1, 2**63):016x}.search.json"
-                try:
-                    search_url = "https://commons.wikimedia.org/w/api.php?" + urlencode({
-                        "action": "query",
-                        "generator": "search",
-                        "gsrsearch": prompt,
-                        "gsrnamespace": 6,
-                        "gsrlimit": 3,
-                        "prop": "imageinfo",
-                        "iiprop": "url",
-                        "iiurlwidth": 800,
-                        "format": "json",
-                    })
-                    curl_download(search_url, search_path)
-                    search_result = json.loads(search_path.read_text("utf-8"))
-                    pages = search_result.get("query", {}).get("pages", {})
-                    for page in pages.values():
-                        info = (page.get("imageinfo") or [{}])[0]
-                        image_url = info.get("thumburl") or info.get("url")
-                        if not image_url:
-                            continue
+                    if not content_type:
+                        raise RuntimeError("Hugging Face did not return a valid JPEG or PNG image.")
+                else:
+                    encoded_prompt = quote(prompt, safe="")
+                    first_seed = random.randrange(1, 2**31)
+                    retry_seed = random.randrange(1, 2**31)
+                    image_urls = (
+                        f"https://pollinations.ai/{encoded_prompt}?model=flux&width=1024&height=1024&nologo=true&enhance=true&seed={first_seed}",
+                        f"https://pollinations.ai/{encoded_prompt}?model=flux&width=1024&height=1024&nologo=true&seed={retry_seed}",
+                    )
+                    for image_url in image_urls:
                         try:
                             curl_download(image_url, output_path)
                             content_type = valid_image_file(output_path)
                             if content_type:
                                 break
-                            failures.append("Wikimedia returned a file that is not a valid JPEG or PNG image.")
+                            failures.append("Pollinations returned a file that is not a valid JPEG or PNG image.")
                         except (OSError, RuntimeError) as exc:
                             failures.append(str(exc))
                         try:
                             output_path.unlink(missing_ok=True)
                         except OSError:
                             pass
-                except (OSError, RuntimeError, json.JSONDecodeError) as exc:
-                    failures.append(str(exc))
-                finally:
-                    try:
-                        search_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
-            if not content_type:
-                failures.append("Wikimedia Commons did not return a valid downloadable image.")
+                    if not content_type:
+                        raise RuntimeError("Could not generate image: " + "; ".join(failures))
+            except (OSError, RuntimeError) as exc:
                 try:
                     output_path.unlink(missing_ok=True)
                 except OSError:
                     pass
-                self._json(502, {"error": "Could not generate image: " + "; ".join(failures)})
+                self._json(502, {"error": str(exc)})
                 return
+            finally:
+                if hf_request_path:
+                    try:
+                        hf_request_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
             extension = ".png" if content_type == "image/png" else ".jpg"
             final_path = output_path.with_suffix(extension)
@@ -397,8 +402,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             except OSError as exc:
                 self._json(500, {"error": f"Could not save generated image: {exc}"})
                 return
-            filename = final_path.name
-            self._json(200, {"url": f"/generated/{filename}"})
+            self._json(200, {"url": f"/generated/{final_path.name}"})
             return
 
         if route == "/api/extract":
