@@ -34,6 +34,15 @@ PORT = int(os.environ.get("PORT", "8080"))
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 OLLAMA_MODELS_CACHE = {"expires": 0.0, "models": []}
 OLLAMA_MODELS_LOCK = threading.Lock()
+OPENROUTER_FREE_MODELS_CACHE = {"expires": 0.0, "models": []}
+OPENROUTER_FREE_MODELS_LOCK = threading.Lock()
+OPENROUTER_FALLBACK_MODELS = [
+    "openrouter/free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "google/gemma-3-27b-it:free",
+    "cognitivecomputations/dolphin-mistral-24b-venice-edition",
+]
 ROOT = Path(__file__).resolve().parent
 BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
 ADMIN_CODE = "apexnode-prog_admin"
@@ -78,6 +87,29 @@ def load_local_env():
             value = value.strip().strip('"').strip("'")
             if not os.environ.get(name.strip()):
                 os.environ[name.strip()] = value
+
+
+def openrouter_discovered_free_models():
+    """Read free model IDs from OpenRouter's public catalog, caching for 10 minutes."""
+    now = time.monotonic()
+    with OPENROUTER_FREE_MODELS_LOCK:
+        if now < OPENROUTER_FREE_MODELS_CACHE["expires"]:
+            return list(OPENROUTER_FREE_MODELS_CACHE["models"])
+        try:
+            request = Request("https://openrouter.ai/api/v1/models", headers={"User-Agent": "Northstar/1.0"})
+            with urlopen(request, timeout=8) as response:
+                catalog = json.loads(response.read(5_000_000))
+            models = list(dict.fromkeys(
+                item.get("id", "") for item in catalog.get("data", [])
+                if isinstance(item, dict) and str(item.get("id", "")).endswith(":free")
+            ))
+            models = [model for model in models if model]
+            OPENROUTER_FREE_MODELS_CACHE.update(expires=now + 600, models=models)
+            return models
+        except (HTTPError, URLError, TimeoutError, OSError, UnicodeError):
+            # Keep serving the configured fallback chain when discovery is unavailable.
+            OPENROUTER_FREE_MODELS_CACHE["expires"] = now + 60
+            return list(OPENROUTER_FREE_MODELS_CACHE["models"])
 
 
 load_local_env()
@@ -1215,17 +1247,9 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     has_images = True
 
             if OPENROUTER_API_KEY:
-                requested_model = str(payload.get("model", "")).strip().lower()
-                preferred_model = (
-                    "nousresearch/hermes-3-llama-3.1-405b:free"
-                    if requested_model.startswith("dolphin-mistral")
-                    else "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"
-                )
-                models = [preferred_model]
-                models.extend(model for model in (
-                    "nousresearch/hermes-3-llama-3.1-405b:free",
-                    "mistralai/mistral-small-3.1-24b-instruct:free",
-                ) if model not in models)
+                models = list(dict.fromkeys(
+                    OPENROUTER_FALLBACK_MODELS + openrouter_discovered_free_models()
+                ))
                 openrouter_messages = []
                 for message in messages:
                     content = message.get("content", "")
@@ -1240,7 +1264,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     openrouter_messages.append({"role": message.get("role", "user"), "content": content})
 
                 upstream = None
-                last_rate_limit = None
+                last_retryable_error = None
                 for model_name in models:
                     openrouter_body = json.dumps({
                         "model": model_name,
@@ -1263,12 +1287,12 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                         upstream = urlopen(request, timeout=180)
                         break
                     except HTTPError as exc:
-                        if exc.code == 429:
-                            last_rate_limit = exc
+                        if exc.code == 404 or exc.code == 429 or 500 <= exc.code <= 599:
+                            last_retryable_error = exc
                             continue
                         raise
                 if upstream is None:
-                    raise last_rate_limit or RuntimeError("All OpenRouter models are rate-limited.")
+                    raise last_retryable_error or RuntimeError("No working OpenRouter model was available.")
 
                 self.send_response(upstream.status)
                 self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
