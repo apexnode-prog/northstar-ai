@@ -52,6 +52,7 @@ BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
 ADMIN_CODE = "apexnode-prog_admin"
 REDEEMED_TXIDS = ROOT / "redeemed_txids.json"
 REDEEM_LOCK = threading.Lock()
+PAID_USERS = ROOT / "paid_users.json"
 IP_USAGE = ROOT / "ip_usage.json"
 IP_USAGE_LOCK = threading.Lock()
 EMAIL_USAGE = ROOT / "email_usage.json"
@@ -90,7 +91,7 @@ def load_local_env():
         if entry.startswith("export "):
             entry = entry[7:].strip()
         name, separator, value = entry.partition("=")
-        if separator and name.strip() in ("SMTP_EMAIL", "SMTP_APP_PASSWORD", "HF_TOKEN", "OPENROUTER_API_KEY"):
+        if separator and name.strip() in ("SMTP_EMAIL", "SMTP_APP_PASSWORD", "HF_TOKEN", "OPENROUTER_API_KEY", "SUPABASE_URL", "SUPABASE_KEY"):
             value = value.strip().strip('"').strip("'")
             if not os.environ.get(name.strip()):
                 os.environ[name.strip()] = value
@@ -101,6 +102,127 @@ SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "").strip()
 SMTP_APP_PASSWORD = os.environ.get("SMTP_APP_PASSWORD", "").replace(" ", "").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "https://qgnkivlzscvxxoancafp.supabase.co").strip().rstrip("/")
+if SUPABASE_URL.endswith("/rest/v1"):
+    SUPABASE_URL = SUPABASE_URL[:-8].rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+
+
+def _supabase_request(method, path, body=None, prefer=None):
+    """Small PostgREST client using only urllib; local JSON remains the no-key fallback."""
+    if not SUPABASE_KEY:
+        raise RuntimeError("Supabase is not configured.")
+    clean_path = str(path).lstrip("/")
+    url = f"{SUPABASE_URL}/rest/v1/{clean_path}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    elif method.upper() == "POST":
+        headers["Prefer"] = "return=representation,resolution=merge-duplicates"
+    request_body = None if body is None else json.dumps(body).encode("utf-8")
+    request = Request(url, data=request_body, headers=headers, method=method.upper())
+    with urlopen(request, timeout=12) as response:
+        content = response.read()
+    return json.loads(content.decode("utf-8")) if content else None
+
+
+def _user_query(email):
+    query = urlencode({"email": f"eq.{email}"})
+    return _supabase_request("GET", f"northstar_users?{query}")
+
+
+def get_user_record(email):
+    email = normalize_email(email)
+    if not email:
+        return None
+    if SUPABASE_KEY:
+        rows = _user_query(email) or []
+        return rows[0] if rows else None
+    verified = email in load_verified_users()
+    used = load_email_usage().get(email, 0)
+    paid = load_paid_users().get(email, {})
+    return {
+        "email": email,
+        "verified": verified,
+        "messages_used": used,
+        "paid": bool(paid),
+        "txid": paid.get("txid"),
+    } if verified or paid else None
+
+
+def upsert_user_record(email, fields):
+    email = normalize_email(email)
+    if not email:
+        raise ValueError("A valid email is required.")
+    record = {"email": email, **fields}
+    if SUPABASE_KEY:
+        query = urlencode({"on_conflict": "email"})
+        rows = _supabase_request(
+            "POST", f"northstar_users?{query}", [record],
+            prefer="return=representation,resolution=merge-duplicates",
+        ) or []
+        if rows:
+            return rows[0]
+        return get_user_record(email) or record
+
+    if "verified" in fields and fields["verified"]:
+        verified = load_verified_users()
+        verified.add(email)
+        serialized = json.dumps(sorted(verified), indent=2) + "\n"
+        VERIFIED_USERS.write_text(serialized, encoding="utf-8")
+        VERIFIED_STUDENTS.write_text(serialized, encoding="utf-8")
+    if "messages_used" in fields:
+        usage = load_email_usage()
+        usage[email] = max(0, int(fields["messages_used"]))
+        save_email_usage(usage)
+    if fields.get("paid") and fields.get("txid"):
+        paid = load_paid_users()
+        paid[email] = {"txid": str(fields["txid"]).lower(), "paid_at": datetime.now().astimezone().isoformat()}
+        temporary = PAID_USERS.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(paid, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(PAID_USERS)
+    return get_user_record(email) or record
+
+
+def redeemed_txid_exists(txid):
+    normalized = str(txid or "").strip().lower()
+    if not normalized:
+        return False
+    if SUPABASE_KEY:
+        query = urlencode({"txid": f"eq.{normalized}", "select": "txid", "limit": "1"})
+        return bool(_supabase_request("GET", f"northstar_redeemed_txids?{query}") or [])
+    return normalized in load_redeemed() or any(
+        str(record.get("txid", "")).strip().lower() == normalized
+        for record in load_paid_users().values()
+    )
+
+
+def insert_redeemed_txid(txid, email):
+    txid = str(txid).strip().lower()
+    email = normalize_email(email)
+    if SUPABASE_KEY:
+        # A unique txid constraint is required on the table. Plain INSERT surfaces
+        # a 409 conflict instead of overwriting the account that redeemed it first.
+        query = urlencode({"select": "txid"})
+        rows = _supabase_request(
+            "POST", f"northstar_redeemed_txids?{query}", [{"txid": txid, "email": email}],
+            prefer="return=representation",
+        )
+        if not rows:
+            raise ValueError("That transaction ID has already been redeemed.")
+        return
+    with REDEEM_LOCK:
+        used = load_redeemed()
+        if txid in used:
+            raise ValueError("That transaction ID has already been redeemed.")
+        used.add(txid)
+        temporary = REDEEMED_TXIDS.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(sorted(used), indent=2) + "\n", encoding="utf-8")
+        temporary.replace(REDEEMED_TXIDS)
 
 
 def normalize_email(value):
@@ -253,9 +375,25 @@ def bitcoin_transaction_received(txid):
 def load_redeemed():
     try:
         values = json.loads(REDEEMED_TXIDS.read_text("utf-8"))
-        return set(values if isinstance(values, list) else [])
+        return {str(value).strip().lower() for value in values} if isinstance(values, list) else set()
     except (OSError, json.JSONDecodeError):
         return set()
+
+
+def load_paid_users():
+    try:
+        values = json.loads(PAID_USERS.read_text("utf-8"))
+        if not isinstance(values, dict):
+            return {}
+        return {str(email).strip().lower(): record for email, record in values.items()
+                if isinstance(record, dict) and record.get("txid")}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def is_paid_email(email):
+    record = get_user_record(email)
+    return bool(record and record.get("paid"))
 
 
 def load_ip_usage():
@@ -1019,16 +1157,25 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             return True
         if not token:
             return False
-        with REDEEM_LOCK:
-            redeemed = {str(value).lower() for value in load_redeemed()}
-        return token.lower() in redeemed
+        try:
+            return redeemed_txid_exists(token)
+        except Exception as exc:
+            print(f"Could not check redeemed TXID in Supabase: {exc}")
+            return False
 
     def _verified_email(self):
         email = normalize_email(self.headers.get("X-User-Email", ""))
         if not email:
             return None
-        with VERIFIED_STUDENTS_LOCK:
-            return email if email in load_verified_users() else None
+        record = get_user_record(email)
+        return email if record and record.get("verified") else None
+
+    def _paid_email(self):
+        email = self._verified_email()
+        if not email:
+            return None
+        record = get_user_record(email)
+        return email if record and record.get("paid") else None
 
     def _trial_key(self):
         email = self._verified_email()
@@ -1037,6 +1184,10 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
     def _trial_snapshot(self, trial_key):
         kind, value = trial_key
         if kind == "email":
+            if SUPABASE_KEY:
+                record = get_user_record(value) or {}
+                used = max(0, int(record.get("messages_used", 0) or 0))
+                return {"used": used, "remaining": max(0, FREE_TRIAL_LIMIT - used)}
             with EMAIL_USAGE_LOCK:
                 used = load_email_usage().get(value, 0)
         else:
@@ -1047,9 +1198,13 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         route = self.path.split("?", 1)[0]
         if route == "/api/trial-status":
-            snapshot = self._trial_snapshot(self._trial_key())
-            snapshot["unlocked"] = self._has_access_token()
-            self._json(200, snapshot)
+            try:
+                snapshot = self._trial_snapshot(self._trial_key())
+                snapshot["unlocked"] = self._has_access_token() or bool(self._paid_email())
+                self._json(200, snapshot)
+            except Exception as exc:
+                print(f"Trial status lookup failed: {exc}")
+                self._json(503, {"error": "Account service is temporarily unavailable."})
             return
         if self.path == "/api/tags":
             try:
@@ -1078,13 +1233,31 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             self._json(400, {"error": "Request body must be a JSON object."})
             return
 
-        if route in ("/api/chat", "/api/image") and not self._has_access_token():
-            user_email_header = self.headers.get("X-User-Email", "").strip()
-            if user_email_header and not self._verified_email():
-                self._json(401, {"error": "Verify your email before using Northstar."})
+        already_unlocked = False
+        if route in ("/api/chat", "/api/image", "/api/edit-image"):
+            try:
+                already_unlocked = self._has_access_token() or bool(self._paid_email())
+            except Exception as exc:
+                print(f"Account access lookup failed: {exc}")
+                self._json(503, {"error": "Account service is temporarily unavailable. Please retry shortly."})
                 return
+        if route in ("/api/chat", "/api/image", "/api/edit-image") and not already_unlocked:
+            user_email_header = self.headers.get("X-User-Email", "").strip()
+            if user_email_header:
+                try:
+                    verified_email = self._verified_email()
+                except Exception as exc:
+                    print(f"Account verification lookup failed: {exc}")
+                    self._json(503, {"error": "Account service is temporarily unavailable. Please retry shortly."})
+                    return
+                if not verified_email:
+                    self._json(401, {"error": "Verify your email before using Northstar."})
+                    return
             if route == "/api/image" and not str(payload.get("prompt", "")).strip():
                 self._json(400, {"error": "A non-empty prompt is required."})
+                return
+            if route == "/api/edit-image" and (not str(payload.get("edit_prompt", payload.get("prompt", ""))).strip() or not str(payload.get("image", "")).strip()):
+                self._json(400, {"error": "Add an image and describe the edit you want."})
                 return
             if route == "/api/chat":
                 request_messages = payload.get("messages")
@@ -1097,23 +1270,42 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 if not any(message.get("role") == "user" and message.get("content") for message in request_messages):
                     self._json(400, {"error": "Add a message before sending."})
                     return
-            kind, trial_key = self._trial_key()
-            usage_lock, load_usage, save_usage = (
-                (EMAIL_USAGE_LOCK, load_email_usage, save_email_usage)
-                if kind == "email" else (IP_USAGE_LOCK, load_ip_usage, save_ip_usage)
-            )
-            with usage_lock:
-                usage = load_usage()
-                used = usage.get(trial_key, 0)
-                if used >= FREE_TRIAL_LIMIT:
-                    self._json(402, {"error": "Free trial limit reached", "remaining": 0})
-                    return
-                usage[trial_key] = used + 1
+            try:
+                kind, trial_key = self._trial_key()
+            except Exception as exc:
+                print(f"Account lookup failed: {exc}")
+                self._json(503, {"error": "Account service is temporarily unavailable. Please retry shortly."})
+                return
+            if kind == "email" and SUPABASE_KEY:
                 try:
-                    save_usage(usage)
-                except OSError as exc:
-                    self._json(500, {"error": f"Could not record free-trial usage: {exc}"})
+                    with EMAIL_USAGE_LOCK:
+                        record = get_user_record(trial_key) or {}
+                        used = max(0, int(record.get("messages_used", 0) or 0))
+                        if used >= FREE_TRIAL_LIMIT:
+                            self._json(402, {"error": "Free trial limit reached", "remaining": 0})
+                            return
+                        upsert_user_record(trial_key, {"verified": True, "messages_used": used + 1})
+                except Exception as exc:
+                    print(f"Account usage update failed: {exc}")
+                    self._json(503, {"error": "Could not update your account usage. Please retry shortly."})
                     return
+            else:
+                usage_lock, load_usage, save_usage = (
+                    (EMAIL_USAGE_LOCK, load_email_usage, save_email_usage)
+                    if kind == "email" else (IP_USAGE_LOCK, load_ip_usage, save_ip_usage)
+                )
+                with usage_lock:
+                    usage = load_usage()
+                    used = usage.get(trial_key, 0)
+                    if used >= FREE_TRIAL_LIMIT:
+                        self._json(402, {"error": "Free trial limit reached", "remaining": 0})
+                        return
+                    usage[trial_key] = used + 1
+                    try:
+                        save_usage(usage)
+                    except OSError as exc:
+                        self._json(500, {"error": f"Could not record free-trial usage: {exc}"})
+                        return
 
         if route in ("/api/student/send-code", "/api/auth/send-code"):
             email = normalize_email(payload.get("email"))
@@ -1145,6 +1337,25 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             self._json(200, {"sent": True, "email": email})
             return
 
+        if route == "/api/auth/login-email":
+            email = normalize_email(payload.get("email"))
+            if not email:
+                self._json(400, {"found": False, "error": "Enter a valid email address."})
+                return
+            try:
+                record = get_user_record(email)
+            except Exception as exc:
+                print(f"Email login lookup failed: {exc}")
+                self._json(503, {"found": False, "error": "Account service is temporarily unavailable. Please retry shortly."})
+                return
+            if not record or not record.get("verified"):
+                self._json(404, {"found": False, "error": "Acct not found. Sign up"})
+                return
+            used = max(0, int(record.get("messages_used", 0) or 0))
+            self._json(200, {"verified": True, "email": email, "paid": bool(record.get("paid")),
+                             "remaining": max(0, FREE_TRIAL_LIMIT - used)})
+            return
+
         if route in ("/api/student/verify-code", "/api/auth/verify-code"):
             email = normalize_email(payload.get("email"))
             code = str(payload.get("code", "")).strip()
@@ -1165,18 +1376,22 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     else:
                         self._json(400, {"verified": False, "error": "That code did not match. Check the email and try again."})
                     return
-                with VERIFIED_STUDENTS_LOCK:
-                    verified = load_verified_users()
-                    verified.add(email)
-                    try:
-                        serialized = json.dumps(sorted(verified), indent=2) + "\n"
-                        VERIFIED_USERS.write_text(serialized, encoding="utf-8")
-                        VERIFIED_STUDENTS.write_text(serialized, encoding="utf-8")
-                    except OSError as exc:
-                        self._json(500, {"verified": False, "error": f"Could not save verified student email: {exc}"})
-                        return
                 STUDENT_OTPS.pop(email, None)
-            self._json(200, {"verified": True, "email": email})
+            try:
+                upsert_user_record(email, {"verified": True})
+                if not SUPABASE_KEY:
+                    with EMAIL_USAGE_LOCK:
+                        usage = load_email_usage()
+                        usage.setdefault(email, 0)
+                        save_email_usage(usage)
+                record = get_user_record(email) or {"messages_used": 0, "paid": False}
+            except Exception as exc:
+                print(f"Verified account persistence failed: {exc}")
+                self._json(503, {"verified": False, "error": "Could not save your account right now. Please retry shortly."})
+                return
+            used = max(0, int(record.get("messages_used", 0) or 0))
+            self._json(200, {"verified": True, "email": email, "paid": bool(record.get("paid")),
+                             "remaining": max(0, FREE_TRIAL_LIMIT - used)})
             return
 
         if route == "/api/verify-btc":
@@ -1190,39 +1405,142 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             if txid and not re.fullmatch(r"[0-9a-f]{64}", txid):
                 self._json(400, {"verified": False, "error": "Enter a valid 64-character Bitcoin transaction ID."})
                 return
-            if txid:
-                with REDEEM_LOCK:
-                    if txid in load_redeemed():
-                        self._json(200, {"verified": True, "previously_redeemed": True})
-                        return
+            email = normalize_email(payload.get("email") or self.headers.get("X-User-Email", ""))
             try:
+                if txid and redeemed_txid_exists(txid):
+                    self._json(200, {"verified": False, "error": "This transaction ID has already been redeemed and cannot be used on another account."})
+                    return
+                if txid and not email:
+                    self._json(400, {"verified": False, "error": "Sign in with a verified email before linking a Bitcoin payment."})
+                    return
+                if txid:
+                    account = get_user_record(email)
+                    if not account or not account.get("verified"):
+                        self._json(401, {"verified": False, "error": "Verify your email before linking a Bitcoin payment."})
+                        return
                 price = btc_usd_price()
                 quote_btc = 2.0 / price
                 if not txid:
                     self._json(200, {"price_usd": price, "btc_due": quote_btc, "address": BTC_ADDRESS})
                     return
-                if not re.fullmatch(r"[0-9a-f]{64}", txid):
-                    self._json(400, {"verified": False, "error": "Enter a valid 64-character Bitcoin transaction ID."})
+                received = bitcoin_transaction_received(txid)
+                if received * price / 100_000_000 < 1.85:
+                    self._json(200, {"verified": False, "error": "This transaction does not show at least $1.85 USD sent to the access address."})
                     return
-                with REDEEM_LOCK:
-                    used = load_redeemed()
-                    if txid in used:
-                        # A returning student must be able to sign in again after
-                        # reload; the access token is the same verified TXID.
-                        self._json(200, {"verified": True, "previously_redeemed": True})
+                try:
+                    insert_redeemed_txid(txid, email)
+                except HTTPError as exc:
+                    if exc.code == 409:
+                        self._json(200, {"verified": False, "error": "This transaction ID has already been redeemed and cannot be used on another account."})
                         return
-                    received = bitcoin_transaction_received(txid)
-                    if received * price / 100_000_000 < 1.85:
-                        self._json(200, {"verified": False, "error": "This transaction does not show at least $1.85 USD sent to the access address."})
-                        return
-                    used.add(txid)
-                    REDEEMED_TXIDS.write_text(json.dumps(sorted(used), indent=2) + "\n", encoding="utf-8")
-                self._json(200, {"verified": True})
+                    raise
+                except ValueError:
+                    self._json(200, {"verified": False, "error": "This transaction ID has already been redeemed and cannot be used on another account."})
+                    return
+                upsert_user_record(email, {"verified": True, "paid": True, "txid": txid})
+                self._json(200, {"verified": True, "paid": True})
             except HTTPError as exc:
                 self._json(502 if exc.code >= 500 else 400, {"verified": False, "error": "The Bitcoin explorer could not find or verify that transaction."})
             except Exception as exc:
                 print(f"Bitcoin verification services failed: {exc}")
                 self._json(502, {"verified": False, "error": "Bitcoin verification services are temporarily unavailable. Please retry shortly."})
+            return
+
+        if route == "/api/edit-image":
+            image_value = str(payload.get("image", "")).strip()
+            image_value = re.sub(r"^data:image/[^;,]+;base64,", "", image_value)
+            try:
+                image_bytes = base64.b64decode(re.sub(r"\s+", "", image_value), validate=True)
+                if not image_bytes or len(image_bytes) > 12_000_000:
+                    raise ValueError("Image must be smaller than 12 MB.")
+                from PIL import Image
+                with Image.open(io.BytesIO(image_bytes)) as source_image:
+                    image_mime = "image/png" if source_image.format == "PNG" else "image/jpeg"
+                    source_image.verify()
+            except Exception:
+                self._json(400, {"error": "The uploaded image is invalid or too large."})
+                return
+            edit_prompt = str(payload.get("edit_prompt", payload.get("prompt", ""))).strip()[:2000]
+            hf_token = str(payload.get("hf_token") or HF_TOKEN).strip()
+            generated_dir = ROOT / "generated"
+            try:
+                generated_dir.mkdir(parents=True, exist_ok=True)
+                output_stem = generated_dir / f"edit-{random.randrange(1, 2**63):016x}"
+                output_path = None
+                if hf_token:
+                    try:
+                        from huggingface_hub import InferenceClient
+                        client = InferenceClient(api_key=hf_token)
+                        result_image = None
+                        for model_id in ("black-forest-labs/FLUX.1-Kontext-dev", "timbrooks/instruct-pix2pix"):
+                            try:
+                                result_image = client.image_to_image(image_bytes, prompt=edit_prompt, model=model_id)
+                                break
+                            except Exception as exc:
+                                print(f"HF image edit model {model_id} unavailable: {exc}")
+                        if result_image is not None:
+                            if isinstance(result_image, (bytes, bytearray)):
+                                result_bytes = bytes(result_image)
+                            else:
+                                result_buffer = io.BytesIO()
+                                result_image.save(result_buffer, format="PNG")
+                                result_bytes = result_buffer.getvalue()
+                            output_path, _mime = save_image_bytes(result_bytes, output_stem)
+                    except Exception as exc:
+                        print(f"Hugging Face image editing unavailable: {exc}")
+
+                if output_path is None:
+                    description = ""
+                    if OPENROUTER_API_KEY:
+                        image_data_url = f"data:{image_mime};base64," + base64.b64encode(image_bytes).decode("ascii")
+                        for vision_model in ("google/gemini-2.0-flash-exp:free", "openrouter/free"):
+                            try:
+                                vision_request = Request(
+                                    "https://openrouter.ai/api/v1/chat/completions",
+                                    data=json.dumps({
+                                        "model": vision_model,
+                                        "stream": False,
+                                        "messages": [{"role": "user", "content": [
+                                            {"type": "text", "text": (
+                                                "Describe the visible image accurately, then turn the requested edit into a concise image-generation prompt. "
+                                                "Preserve the same subject identity, pose, framing, and background unless the requested edit changes them. "
+                                                f"Requested edit: {edit_prompt}"
+                                            )},
+                                            {"type": "image_url", "image_url": {"url": image_data_url}},
+                                        ]}],
+                                    }).encode("utf-8"),
+                                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+                                    method="POST",
+                                )
+                                with urlopen(vision_request, timeout=30) as response:
+                                    vision_result = json.loads(response.read())
+                                content = vision_result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                if isinstance(content, list):
+                                    content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
+                                description = str(content).strip()
+                                if description:
+                                    break
+                            except Exception as exc:
+                                print(f"OpenRouter image description model {vision_model} unavailable: {exc}")
+                    generation_prompt = (
+                        f"Create a faithful edited image based on this request: {edit_prompt}. "
+                        "Preserve the original subject, pose, composition, and background wherever possible. "
+                        + (f"Image description and edit direction: {description}" if description else "")
+                    )
+                    try:
+                        output_path, _mime = ai_horde_image(generation_prompt, output_stem)
+                    except Exception as exc:
+                        print(f"AI Horde image edit fallback unavailable: {exc}")
+                        output_path, _mime = local_image_fallback(generation_prompt, output_stem)
+
+                extension = ".png" if valid_image_file(output_path) == "image/png" else ".jpg"
+                final_path = output_path.with_suffix(extension)
+                if final_path != output_path:
+                    output_path.replace(final_path)
+                self._json(200, {"url": f"/generated/{final_path.name}", "message": "Here is the edited image."})
+            except Exception as exc:
+                print(f"Image editing failed: {exc}")
+                self._json(502, {"error": "The image edit could not be completed right now. Try again shortly."})
             return
 
         if route == "/api/image":
@@ -1382,7 +1700,17 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             personalization = f'Your assigned name is {json.dumps(ai_name, ensure_ascii=False)}.'
             if user_name:
                 personalization += f' The user\'s preferred name is {json.dumps(user_name, ensure_ascii=False)}; use it naturally and sparingly.'
+            if re.fullmatch(rf"(?:(?:hey|hello|hi)\s+)?{re.escape(ai_name)}[\s?!.,]*", user_prompt.strip(), re.IGNORECASE):
+                personalization += " The latest message is the user calling your name; recognize it as addressing you and reply warmly and attentively in one short sentence."
             dated_system_prompt = f"{NORTHSTAR_SYSTEM_PROMPT}\n{personalization}\nCurrent date: {current_date}. Use this date when interpreting words like today, recent, and current."
+            study_mode = str(payload.get("study_mode", "")).strip().lower()
+            mode_instructions = {
+                "quiz": "Create exactly five multiple-choice questions. For each use this exact line-based format: Q1: question, then A) option, B) option, C) option, D) option, Answer: X, Explanation: short reason, with each field on its own line. Repeat Q2 through Q5. Use one correct answer and plausible distractors so the options can be made interactive.",
+                "flashcards": "Create 8 to 12 flashcards, each on one line using exactly Front: term or question | Back: concise definition or answer. Do not use a table.",
+                "essay": "Coach the essay with a clear thesis evaluation, structure, clarity and grammar feedback, and a polished rewrite of the supplied draft or a sample paragraph if the user supplied only a topic. Preserve the user's intended meaning.",
+            }
+            if study_mode in mode_instructions:
+                dated_system_prompt += " " + mode_instructions[study_mode]
             if deep_reasoning:
                 dated_system_prompt += (
                     " For this request, reason carefully through the problem privately, verify calculations, "
