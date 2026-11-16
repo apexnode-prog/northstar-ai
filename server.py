@@ -10,6 +10,11 @@ from urllib.parse import urlencode
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 import zlib
+import ast
+import difflib
+import tempfile
+import hashlib
+import shutil
 import struct
 import base64
 import io
@@ -40,6 +45,7 @@ FAST_STUDY_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-3-27b-it:free",
     "mistralai/mistral-small-3.1-24b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free",
 ]
 DEEP_REASONING_MODELS = [
     "deepseek/deepseek-r1:free",
@@ -49,7 +55,19 @@ DEEP_REASONING_MODELS = [
 ]
 ROOT = Path(__file__).resolve().parent
 BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
-ADMIN_CODE = "apexnode-prog_admin"
+ADMIN_EMAIL = "ayormarf@icloud.com"
+ADMIN_OTP_LOCK = threading.Lock()
+ADMIN_OTPS = {}
+ADMIN_SESSIONS = {}
+ADMIN_SESSIONS_LOCK = threading.Lock()
+ACTIVE_SESSIONS = {}
+ACTIVE_SESSIONS_LOCK = threading.Lock()
+ADMIN_SESSION_TTL = 12 * 60 * 60
+KNOWLEDGE_PATH = ROOT / "northstar_knowledge.json"
+KNOWLEDGE_LOCK = threading.Lock()
+KNOWLEDGE_CACHE = {"expires": 0.0, "items": []}
+OPENROUTER_MODELS_CACHE = {"expires": 0.0, "models": []}
+OPENROUTER_MODELS_LOCK = threading.Lock()
 REDEEMED_TXIDS = ROOT / "redeemed_txids.json"
 REDEEM_LOCK = threading.Lock()
 PAID_USERS = ROOT / "paid_users.json"
@@ -636,9 +654,9 @@ def describe_image_edit(image_bytes, image_mime, edit_prompt):
     image_data_url = f"data:{image_mime};base64," + base64.b64encode(image_bytes).decode("ascii")
     instruction = (
         "Inspect the supplied image accurately and follow the edit instruction exactly. "
-        "Return a compact visual description and a detailed image-generation prompt that applies only the requested changes. "
+        "Return JSON with keys description, edit_prompt, and watermark_box; watermark_box is normalized [left,top,right,bottom] coordinates or null. "
         "Preserve subject identity, pose, framing, clothing, lighting, and background unless the user requests a change. "
-        "Do not invent additional changes.\nEdit instruction: " + str(edit_prompt)
+        "If the user asks to remove a watermark, locate it precisely. Do not invent additional changes.\nEdit instruction: " + str(edit_prompt)
     )
     if OPENROUTER_API_KEY:
         for model_name in ("openrouter/free", "google/gemma-3-27b-it:free"):
@@ -739,6 +757,52 @@ def pollinations_image(prompt, output_path, seed):
             last_error = exc
     raise RuntimeError("Pollinations image generation failed.") from last_error
 
+def pil_remove_watermark(image_bytes, vision_analysis):
+    """Best-effort local inpainting for a vision-located watermark rectangle."""
+    from PIL import Image, ImageFilter, ImageDraw
+    try:
+        text = str(vision_analysis or "")
+        match = re.search(r"\{[\s\S]*?\}", text)
+        bbox = None
+        if match:
+            parsed = json.loads(match.group(0))
+            candidate = parsed.get("watermark_box")
+            if isinstance(candidate, list) and len(candidate) == 4:
+                values = [float(value) for value in candidate]
+                if all(0 <= value <= 1 for value in values) and values[2] > values[0] and values[3] > values[1]:
+                    bbox = values
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            image = source.convert("RGB")
+        width, height = image.size
+        if bbox:
+            x1, y1, x2, y2 = [round(value * dimension) for value, dimension in zip(bbox, (width, height, width, height))]
+        else:
+            lower = bool(re.search(r"bottom|lower", text, re.I))
+            left = bool(re.search(r"left", text, re.I))
+            center = bool(re.search(r"center|middle", text, re.I))
+            box_w, box_h = max(36, round(width * (0.5 if center else 0.20))), max(18, round(height * 0.10))
+            x1 = (width-box_w)//2 if center else (0 if left else width-box_w)
+            y1 = (height-box_h)//2 if center else (height-box_h if lower or not re.search(r"top|upper", text, re.I) else 0)
+            x2, y2 = x1+box_w, y1+box_h
+        x1=max(0,min(width-1,x1));x2=max(x1+1,min(width,x2));y1=max(0,min(height-1,y1));y2=max(y1+1,min(height,y2))
+        box_w, box_h = x2-x1, y2-y1
+        # Copy adjacent clean texture, blur the clone boundary, and feather-blend it over the mark.
+        source_y = y1-box_h-3 if y1-box_h-3 >= 0 else min(height-box_h, y2+3)
+        source_x = x1-box_w-3 if x1-box_w-3 >= 0 else min(width-box_w, x2+3)
+        patch = image.crop((source_x, source_y, source_x+box_w, source_y+box_h)).filter(ImageFilter.GaussianBlur(radius=max(1, min(box_w, box_h)//24)))
+        mask = Image.new("L", (box_w, box_h), 255)
+        draw = ImageDraw.Draw(mask)
+        feather=max(2,min(box_w,box_h)//10)
+        for offset in range(feather):
+            alpha=round(255*(offset+1)/feather)
+            draw.rectangle((offset,offset,box_w-1-offset,box_h-1-offset),outline=alpha)
+        image.paste(patch,(x1,y1),mask)
+        output=io.BytesIO();image.save(output,format="PNG")
+        return output.getvalue()
+    except Exception:
+        return b""
+
+
 def search_image_fallback(prompt, output_path):
     """Find a fresh high-resolution DuckDuckGo or Wikimedia result and normalize it."""
     keywords = re.sub(r"\s+", " ", re.sub(r"[^\w -]", " ", str(prompt), flags=re.UNICODE)).strip()[:100] or "education"
@@ -775,7 +839,7 @@ def search_image_fallback(prompt, output_path):
 
 
 def local_image_fallback(prompt, output_path):
-    """Create a valid local educational illustration if all remote services fail."""
+    """Create a fresh local visual illustration if all remote services fail."""
     from PIL import Image, ImageDraw, ImageFont
 
     seed = random.randint(1, 999999999)
@@ -1146,6 +1210,106 @@ def _wikipedia_search(query):
 IP_LOCATION_CACHE = {}
 IP_LOCATION_LOCK = threading.Lock()
 
+def discover_openrouter_free_models(timeout=2.0):
+    now = time.monotonic()
+    with OPENROUTER_MODELS_LOCK:
+        if OPENROUTER_MODELS_CACHE["expires"] > now:
+            return list(OPENROUTER_MODELS_CACHE["models"])
+    found = []
+    if OPENROUTER_API_KEY:
+        try:
+            request = Request("https://openrouter.ai/api/v1/models", headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Accept": "application/json"})
+            with urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read())
+            for item in data.get("data", []):
+                model_id = str(item.get("id", ""))
+                if model_id.endswith(":free") and model_id not in FAST_STUDY_MODELS and model_id not in DEEP_REASONING_MODELS:
+                    found.append(model_id)
+            found = found[:3]
+        except Exception:
+            found = []
+    with OPENROUTER_MODELS_LOCK:
+        OPENROUTER_MODELS_CACHE.update({"expires": now + 600, "models": found})
+    return found
+
+
+KNOWLEDGE_STOPWORDS = {"the", "and", "are", "is", "was", "were", "there", "that", "this", "with", "from", "into", "about", "what", "when", "where", "which", "who", "how", "many", "much", "does", "did", "do", "of", "in", "on", "to", "a", "an", "for", "as", "at", "by", "be", "has", "have", "had", "it", "its"}
+
+def _knowledge_terms(value):
+    terms = re.findall(r"[a-z0-9]+", str(value or "").lower())
+    normalized = set()
+    for term in terms:
+        if term in KNOWLEDGE_STOPWORDS or len(term) < 3: continue
+        if term.endswith("ies") and len(term) > 4: term = term[:-3] + "y"
+        elif term.endswith("s") and len(term) > 4: term = term[:-1]
+        normalized.add(term)
+    return normalized
+
+def _local_knowledge():
+    try:
+        values = json.loads(KNOWLEDGE_PATH.read_text("utf-8"))
+        return values if isinstance(values, list) else []
+    except Exception:
+        return []
+
+def _load_global_knowledge():
+    now = time.monotonic()
+    with KNOWLEDGE_LOCK:
+        if KNOWLEDGE_CACHE["expires"] > now:
+            return list(KNOWLEDGE_CACHE["items"])
+    items = _local_knowledge()
+    if SUPABASE_KEY:
+        try:
+            rows = _supabase_request("GET", "northstar_knowledge?select=fact_key,corrected_answer,updated_at&limit=500", timeout=1.5) or []
+            by_key = {str(item.get("fact_key", "")).lower(): item for item in items if isinstance(item, dict)}
+            for row in rows:
+                if isinstance(row, dict) and row.get("fact_key"):
+                    by_key[str(row["fact_key"]).lower()] = row
+            items = list(by_key.values())
+        except Exception:
+            pass
+    with KNOWLEDGE_LOCK:
+        KNOWLEDGE_CACHE.update({"expires": now + 60, "items": list(items)})
+    return items
+
+def _store_global_correction(statement):
+    statement = re.sub(r"\s+", " ", str(statement or "")).strip()[:2000]
+    if not statement:
+        raise ValueError("The correction is empty.")
+    record = {"fact_key": statement[:240], "corrected_answer": statement, "updated_at": datetime.now().astimezone().isoformat()}
+    items = [item for item in _local_knowledge() if not (isinstance(item, dict) and str(item.get("fact_key", "")).lower() == record["fact_key"].lower())]
+    items.append(record)
+    with KNOWLEDGE_LOCK:
+        temporary = KNOWLEDGE_PATH.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(KNOWLEDGE_PATH)
+        KNOWLEDGE_CACHE.update({"expires": time.monotonic() + 60, "items": list(items)})
+    if SUPABASE_KEY:
+        try:
+            query = urlencode({"on_conflict": "fact_key"})
+            _supabase_request("POST", f"northstar_knowledge?{query}", [record], prefer="return=representation,resolution=merge-duplicates", timeout=3)
+        except Exception:
+            pass
+    return record
+
+def _matching_global_corrections(query, limit=4):
+    query_terms = _knowledge_terms(query)
+    if not query_terms: return []
+    matches = []
+    for item in _load_global_knowledge():
+        if not isinstance(item, dict): continue
+        key_terms = _knowledge_terms(item.get("fact_key", ""))
+        overlap = query_terms & key_terms
+        if overlap and (len(overlap) >= 2 or len(query_terms) <= 3):
+            matches.append((len(overlap) / max(1, len(key_terms)), item))
+    matches.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in matches[:limit]]
+
+def _admin_correction_text(query):
+    match = re.match(r"^\s*(?:correct yourself(?:\s*[,.:;!?-]?\s*)?|remember that\s+|global fact(?:\s*[:=-]\s*)?|for future users[,.:;!?-]?\s*)", str(query or ""), re.I)
+    if not match: return ""
+    return str(query[match.end():]).strip(" .!?\n")[:2000]
+
 def _ip_location(ip, accept_language="en"):
     key = (str(ip or "").strip(), str(accept_language or "en").split(",", 1)[0].strip())
     now = time.monotonic()
@@ -1196,6 +1360,8 @@ def web_search(query, visitor=None):
         jobs[pool.submit(_wikipedia_search, query)] = "snippets"
     if visitor and re.search(r"\bweather\b", query, re.I):
         jobs[pool.submit(_open_meteo_weather, visitor)] = "weather"
+    if re.search(r"\b(?:stock|share|ticker|market|finance|earnings|nasdaq|nyse|bitcoin|crypto|price)\b", query, re.I):
+        jobs[pool.submit(_yahoo_finance_search, query)] = "markets"
     for url in explicit_urls:
         jobs[pool.submit(fetch_webpage, url, 3, 4000)] = "page"
     results, pages, weather = [], [], None
@@ -1298,9 +1464,65 @@ def should_search_web(query, enabled=True):
     return needs_live_search(query) or (bool(enabled) and bool(FACTUAL_OR_RESEARCH_RE.search(str(query or ""))))
 
 
+def _yahoo_finance_search(query):
+    url = "https://query1.finance.yahoo.com/v1/finance/search?" + urlencode({"q": query, "quotesCount": 5, "newsCount": 5})
+    try:
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0 Northstar/1.0", "Accept": "application/json"})
+        with urlopen(request, timeout=2.5) as response:
+            data = json.loads(response.read())
+        results = []
+        for item in (data.get("news") or [])[:4]:
+            results.append({"title": item.get("title", "Market news"), "url": item.get("link", ""), "snippet": item.get("summary", "") or item.get("title", "")})
+        for item in (data.get("quotes") or [])[:3]:
+            symbol = item.get("symbol", "")
+            if symbol:
+                price = item.get("regularMarketPrice")
+                currency = item.get("currency", "")
+                detail = f"Live matched quote: {price} {currency}." if price is not None else f"Yahoo Finance matched {item.get('quoteType', 'security')} {symbol}; current price is shown on the live quote page."
+                results.append({"title": f"{item.get('shortname') or symbol} ({symbol})", "url": f"https://finance.yahoo.com/quote/{quote(symbol, safe='')}", "snippet": detail})
+        return results
+    except Exception:
+        return []
+
+
 def fallback_search_answer(query):
-    """Never substitute unrelated search snippets for a model answer."""
-    return "I couldn’t reach a reply model just now. Please try again in a moment."
+    """Return a relevant source-backed fallback instead of a provider error."""
+    query = str(query or "").strip()
+    if not query:
+        return "What would you like to know?"
+    jobs = {}
+    pool = ThreadPoolExecutor(max_workers=3)
+    jobs[pool.submit(_duckduckgo_search, query)] = "web"
+    jobs[pool.submit(_wikipedia_search, query)] = "encyclopedia"
+    if re.search(r"\b(?:stock|share|ticker|market|finance|earnings|nasdaq|nyse|bitcoin|crypto|price)\b", query, re.I):
+        jobs[pool.submit(_yahoo_finance_search, query)] = "markets"
+    results = []
+    deadline = time.monotonic() + 2.5
+    try:
+        for future in as_completed(jobs, timeout=2.5):
+            try:
+                items = future.result()
+                for item in (items if isinstance(items, list) else [items] if items else []):
+                    if isinstance(item, dict) and item.get("snippet"):
+                        results.append((jobs[future], item))
+            except Exception:
+                continue
+    except FuturesTimeoutError:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    seen, lines = set(), []
+    for category, item in results:
+        url = str(item.get("url", ""))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        lines.append(f"- {item.get('title') or category}: {str(item.get('snippet', '')).strip()[:500]} (Source: {url})")
+        if len(lines) >= 4:
+            break
+    if lines:
+        return "Here is the most relevant information I could verify from live sources:\n" + "\n".join(lines)
+    return "I can’t verify that from live sources right now. If you share a source or a little more detail, I can help assess it."
 
 
 class ThinkTagStreamFilter:
@@ -1380,6 +1602,57 @@ def extract_pdf(data):
     return "\n".join(extracted)
 
 
+
+class _HTMLBalanceChecker(HTMLParser):
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+    OPTIONAL_CLOSE = {"p", "li", "dt", "dd", "option", "optgroup", "tr", "td", "th", "thead", "tbody", "tfoot"}
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.errors = []
+    def handle_starttag(self, tag, attrs):
+        if tag in self.VOID_TAGS: return
+        if tag in self.OPTIONAL_CLOSE and self.stack and self.stack[-1] == tag:
+            self.stack.pop()
+        self.stack.append(tag)
+    def handle_startendtag(self, tag, attrs):
+        return
+    def handle_endtag(self, tag):
+        if tag in self.VOID_TAGS: return
+        if tag not in self.stack:
+            self.errors.append(f"Unexpected closing tag: {tag}")
+            return
+        while self.stack:
+            current = self.stack.pop()
+            if current == tag: return
+            if current not in self.OPTIONAL_CLOSE:
+                self.errors.append(f"Unclosed tag before </{tag}>: {current}")
+
+def _validate_server_sources():
+    server_source = (ROOT / "server.py").read_text("utf-8")
+    ast.parse(server_source, filename="server.py")
+    html_source = (ROOT / "index.html").read_text("utf-8")
+    parser = _HTMLBalanceChecker()
+    parser.feed(html_source)
+    parser.close()
+    if parser.errors or parser.stack:
+        raise RuntimeError("HTML balance check failed: " + "; ".join(parser.errors or parser.stack[-5:]))
+    inline_scripts = re.findall(r"<script(?:\s[^>]*)?>([\s\S]*?)</script>", html_source, re.I)
+    if not inline_scripts:
+        raise RuntimeError("No inline application script was found.")
+    node = shutil.which("node")
+    if not node:
+        raise RuntimeError("JavaScript syntax validation is unavailable because Node.js is missing.")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".js", delete=False) as script_file:
+        script_file.write("\n".join(inline_scripts))
+        script_path = Path(script_file.name)
+    try:
+        result = subprocess.run([node, "--check", str(script_path)], capture_output=True, text=True, timeout=8)
+        if result.returncode:
+            raise RuntimeError("JavaScript syntax check failed.")
+    finally:
+        script_path.unlink(missing_ok=True)
+
 class NorthstarHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -1399,6 +1672,9 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         self._northstar_response_started = False
         try:
+            if self.path.startswith("/api/"):
+                try: self._track_device()
+                except Exception: pass
             self._do_GET()
         except Exception as exc:
             print(f"Unhandled GET route error for {self.path}: {exc}")
@@ -1443,17 +1719,47 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         except ValueError:
             return str(self.client_address[0])
 
-    def _has_access_token(self):
-        token = self.headers.get("X-Access-Token", "").strip()
-        if token and hmac.compare_digest(token, ADMIN_CODE):
-            return True
+    def _is_admin_session(self, token=None):
+        token = str(token if token is not None else self.headers.get("X-Access-Token", "")).strip()
         if not token:
             return False
+        now = time.time()
+        with ADMIN_SESSIONS_LOCK:
+            expires = ADMIN_SESSIONS.get(token)
+            if expires and expires > now:
+                return True
+            ADMIN_SESSIONS.pop(token, None)
+        return False
+
+    def _has_access_token(self):
+        token = self.headers.get("X-Access-Token", "").strip()
+        if not token:
+            return False
+        if self._is_admin_session(token):
+            return True
         try:
             return redeemed_txid_exists(token)
         except Exception as exc:
             print(f"Could not check redeemed TXID in Supabase: {exc}")
             return False
+
+    def _track_device(self):
+        token = self.headers.get("X-Access-Token", "").strip()
+        email = self._verified_email() if self.headers.get("X-User-Email") else None
+        role = "admin" if self._is_admin_session(token) else "user" if email else "guest"
+        sid = re.sub(r"[^A-Za-z0-9_.:-]", "", self.headers.get("X-Session-Id", ""))[:120]
+        if not sid:
+            material = "|".join((email or role, self._visitor_ip(), self.headers.get("User-Agent", "")))
+            sid = hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()[:24]
+        record = {"session_id": sid, "ip": self._visitor_ip(), "user_agent": self.headers.get("User-Agent", "")[:180],
+                  "email": ADMIN_EMAIL if role == "admin" else email, "role": role, "last_seen": datetime.now().astimezone().isoformat(),
+                  "last_seen_epoch": time.time()}
+        now = time.time()
+        with ACTIVE_SESSIONS_LOCK:
+            ACTIVE_SESSIONS[sid] = record
+            for key in list(ACTIVE_SESSIONS):
+                if now - ACTIVE_SESSIONS[key].get("last_seen_epoch", 0) > 300:
+                    ACTIVE_SESSIONS.pop(key, None)
 
     def _verified_email(self):
         email = normalize_email(self.headers.get("X-User-Email", ""))
@@ -1489,6 +1795,12 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
 
     def _handle_get(self):
         route = self.path.split("?", 1)[0]
+        if route == "/api/admin/telemetry":
+            if not self._is_admin_session():
+                self._json(403, {"error": "Admin authentication is required."})
+                return
+            self._json(200, self._admin_diagnostics())
+            return
         if route == "/api/trial-status":
             try:
                 snapshot = self._trial_snapshot(self._trial_key())
@@ -1555,11 +1867,95 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 openrouter_status = f"HTTP {exc.code}"
             except Exception:
                 openrouter_status = "configured but unreachable"
+        now = time.time()
+        with ACTIVE_SESSIONS_LOCK:
+            devices = [dict(item) for item in ACTIVE_SESSIONS.values() if now - item.get("last_seen_epoch", 0) <= 300]
+        online_users = len({item.get("email") for item in devices if item.get("role") == "user" and item.get("email")})
+        for item in devices:
+            item.pop("last_seen_epoch", None)
         return {"recent_logs": logs or ["No server.log file is present; runtime output is managed by the process supervisor."],
+                "live_stats": {"online_users": online_users, "active_devices": devices, "active_device_count": len(devices)},
                 "service_status": {"openrouter": openrouter_status, "supabase": supabase_status, "huggingface_token_configured": bool(HF_TOKEN)},
                 "account_payment_stats": {"verified_users_local": user_count, "redeemed_txids_local": payment_count,
                                            "verified_users_supabase": remote_user_count, "redeemed_txids_supabase": remote_payment_count},
                 "source_overview": source_overview}
+
+    def _handle_admin_self_edit(self, payload):
+        instruction = str(payload.get("instruction", "")).strip()[:5000]
+        if not instruction:
+            self._json(400, {"applied": False, "error": "Provide a code change instruction."})
+            return
+        if not OPENROUTER_API_KEY:
+            self._json(503, {"applied": False, "error": "Code patch generation is unavailable until OpenRouter is configured."})
+            return
+        sources = {}
+        for name in ("server.py", "index.html"):
+            try: sources[name] = (ROOT / name).read_text("utf-8")
+            except OSError:
+                self._json(500, {"applied": False, "error": f"Could not read {name}."})
+                return
+        system = ("Create a minimal unified diff for only server.py and/or index.html. The patch must be safe, "
+                  "preserve existing auth/payment data, and satisfy the exact Admin instruction. Return ONLY JSON "
+                  "with string keys summary and patch. Do not include markdown fences or new files.")
+        prompt = f"Admin instruction:\n{instruction}\n\nCurrent server.py:\n{sources['server.py'][:42000]}\n\nCurrent index.html:\n{sources['index.html'][:42000]}"
+        result = None
+        for model_name in list(dict.fromkeys(FAST_STUDY_MODELS + discover_openrouter_free_models())):
+            request = Request("https://openrouter.ai/api/v1/chat/completions", data=json.dumps({
+                "model": model_name, "stream": False, "temperature": 0.1,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            }).encode("utf-8"), headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}, method="POST")
+            try:
+                with urlopen(request, timeout=8) as response:
+                    response_data = json.loads(response.read())
+                result = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if result: break
+            except Exception:
+                continue
+        try:
+            payload_out = json.loads(str(result or ""))
+            patch = str(payload_out.get("patch", ""))
+            summary = str(payload_out.get("summary", "Code patch prepared."))[:1000]
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            self._json(502, {"applied": False, "error": "The patch generator did not return a valid JSON diff."})
+            return
+        if not patch.strip():
+            self._json(422, {"applied": False, "error": "The requested instruction produced no code changes."})
+            return
+        headers = re.findall(r"^diff --git a/([^ ]+) b/([^\n]+)$", patch, re.M)
+        if not headers or any(a != b or a not in ("server.py", "index.html") for a, b in headers):
+            self._json(400, {"applied": False, "error": "Patch rejected: it may only modify server.py or index.html."})
+            return
+        path_headers = re.findall(r"^(?:---|\+\+) (.+)$", patch, re.M)
+        allowed_paths = {"a/server.py", "b/server.py", "a/index.html", "b/index.html"}
+        if any(path.split("\t", 1)[0] not in allowed_paths for path in path_headers):
+            self._json(400, {"applied": False, "error": "Patch rejected: every patch section must target server.py or index.html."})
+            return
+        if "GIT binary patch" in patch or "new file mode" in patch or "deleted file mode" in patch or "rename from " in patch or "rename to " in patch:
+            self._json(400, {"applied": False, "error": "Patch rejected: new, deleted, or binary files are not allowed."})
+            return
+        check = subprocess.run(["git", "apply", "--check", "--whitespace=error"], cwd=ROOT, input=patch, text=True, capture_output=True, timeout=8)
+        if check.returncode:
+            self._json(422, {"applied": False, "error": "Patch validation failed against the current source."})
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backups = {}
+        try:
+            for name, content in sources.items():
+                if any(a == name for a, _ in headers):
+                    backup = ROOT / f"{name}.{stamp}.bak"
+                    backup.write_text(content, encoding="utf-8")
+                    backups[name] = backup
+            apply = subprocess.run(["git", "apply", "--whitespace=error"], cwd=ROOT, input=patch, text=True, capture_output=True, timeout=8)
+            if apply.returncode:
+                raise RuntimeError("Could not apply the validated patch.")
+            _validate_server_sources()
+        except Exception as exc:
+            for name in backups:
+                (ROOT / name).write_text(sources[name], encoding="utf-8")
+            self._json(422, {"applied": False, "error": str(exc), "backups": [path.name for path in backups.values()]})
+            return
+        self._json(200, {"applied": True, "summary": summary, "files": [a for a, _ in headers],
+                         "backups": [path.name for path in backups.values()], "restart_required": True})
 
     def _try_local_chat_fallback(self, messages, emit_assistant_response):
         """Use a locally installed Ollama model when all OpenRouter models fail."""
@@ -1598,7 +1994,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 "options": {"num_ctx": 8192, "num_predict": 2048, "temperature": 0.7},
             }).encode("utf-8")
             request = Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
-            with urlopen(request, timeout=22) as response:
+            with urlopen(request, timeout=8) as response:
                 result = json.loads(response.read())
             answer = str(result.get("message", {}).get("content", result.get("response", ""))).strip()
             if not answer:
@@ -1649,6 +2045,86 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             return
         if not isinstance(payload, dict):
             self._json(400, {"error": "Request body must be a JSON object."})
+            return
+        if route.startswith("/api/"):
+            try: self._track_device()
+            except Exception: pass
+
+        if route == "/api/admin/send-code":
+            if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
+                self._json(503, {"sent": False, "error": "Admin email delivery is not configured."})
+                return
+            now = time.time()
+            with ADMIN_OTP_LOCK:
+                previous = ADMIN_OTPS.get("_sent_at", 0)
+                if now - previous < 30:
+                    self._json(429, {"sent": False, "error": "A code was sent recently. Check your inbox before requesting another."})
+                    return
+                alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*+-_?"
+                symbols = "!@#$%&*+-_?"
+                chars = [secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ"), secrets.choice("abcdefghijkmnopqrstuvwxyz"), secrets.choice("23456789"), secrets.choice(symbols)]
+                chars += [secrets.choice(alphabet) for _ in range(8)]
+                secrets.SystemRandom().shuffle(chars)
+                code = "".join(chars)
+                ADMIN_OTPS["_sent_at"] = now
+            message = EmailMessage()
+            message["Subject"] = "Your Northstar Admin login code"
+            message["From"] = SMTP_EMAIL
+            message["To"] = ADMIN_EMAIL
+            message.set_content(f"Your 12-character Northstar Admin login code is: {code}\n\nIt expires in 10 minutes. If you did not request it, ignore this email.")
+            try:
+                with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=12, context=ssl.create_default_context()) as smtp:
+                    smtp.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
+                    smtp.send_message(message)
+            except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+                print(f"Admin OTP email delivery failed: {exc}")
+                self._json(502, {"sent": False, "error": "Could not send the Admin code. Check the mail service and retry."})
+                return
+            with ADMIN_OTP_LOCK:
+                ADMIN_OTPS["code"] = {"value": code, "expires": time.time() + 600, "attempts": 0}
+            self._json(200, {"sent": True, "expires_in": 600})
+            return
+
+        if route == "/api/admin/verify-code":
+            code = str(payload.get("code", ""))
+            with ADMIN_OTP_LOCK:
+                record = ADMIN_OTPS.get("code")
+                if not record or time.time() >= record["expires"]:
+                    ADMIN_OTPS.pop("code", None)
+                    self._json(400, {"verified": False, "error": "That Admin code expired. Request a new one."})
+                    return
+                if len(code) != 12 or not hmac.compare_digest(code, record["value"]):
+                    record["attempts"] += 1
+                    if record["attempts"] >= 5:
+                        ADMIN_OTPS.pop("code", None)
+                    self._json(400, {"verified": False, "error": "That Admin code did not match."})
+                    return
+                ADMIN_OTPS.pop("code", None)
+            token = secrets.token_urlsafe(48)
+            with ADMIN_SESSIONS_LOCK:
+                ADMIN_SESSIONS[token] = time.time() + ADMIN_SESSION_TTL
+            self._json(200, {"verified": True, "role": "admin", "token": token, "expires_in": ADMIN_SESSION_TTL})
+            return
+
+        if route == "/api/admin/session":
+            if not self._is_admin_session():
+                self._json(401, {"verified": False, "error": "Admin session expired."})
+                return
+            self._json(200, {"verified": True, "role": "admin"})
+            return
+
+        if route == "/api/admin/telemetry":
+            if not self._is_admin_session():
+                self._json(403, {"error": "Admin authentication is required."})
+                return
+            self._json(200, self._admin_diagnostics())
+            return
+
+        if route == "/api/admin/self-edit":
+            if not self._is_admin_session():
+                self._json(403, {"error": "Admin authentication is required."})
+                return
+            self._handle_admin_self_edit(payload)
             return
 
         already_unlocked = False
@@ -1815,10 +2291,6 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         if route == "/api/verify-btc":
             submitted_txid = str(payload.get("txid", "")).strip()
             submitted_code = str(payload.get("code", "")).strip()
-            if any(hmac.compare_digest(candidate, ADMIN_CODE)
-                   for candidate in (submitted_txid, submitted_code) if candidate):
-                self._json(200, {"verified": True, "admin": True})
-                return
             txid = (submitted_txid or submitted_code).lower()
             if txid and not re.fullmatch(r"[0-9a-f]{64}", txid):
                 self._json(400, {"verified": False, "error": "Enter a valid 64-character Bitcoin transaction ID."})
@@ -1939,19 +2411,25 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
 
                 if output_path is None:
                     description = describe_image_edit(image_bytes, image_mime, edit_prompt)
+                    watermark_only = bool(re.search(r"\bremove\s+(?:the\s+)?watermark\b", edit_prompt, re.I)) and not bool(re.search(r"\b(?:change|replace|add|recolor|crop|background|hair|color)\b", edit_prompt, re.I))
+                    if watermark_only:
+                        cleaned = pil_remove_watermark(image_bytes, description)
+                        if cleaned:
+                            output_path, _mime = save_image_bytes(cleaned, output_stem)
                     generation_prompt = (
                         f"Create a faithful edited image based on this request: {edit_prompt}. "
                         "Preserve the original subject, pose, composition, and background wherever possible. "
                         + (f"Image description and edit direction: {description}" if description else "")
                     )
                     edit_seed = random.randint(1, 999999999)
-                    try:
-                        output_path, _mime = ai_horde_image(generation_prompt, output_stem, edit_seed)
-                    except Exception:
+                    if output_path is None:
                         try:
-                            output_path, _mime = pollinations_image(generation_prompt, output_stem, edit_seed)
+                            output_path, _mime = ai_horde_image(generation_prompt, output_stem, edit_seed)
                         except Exception:
-                            output_path, _mime = local_image_fallback(generation_prompt, output_stem)
+                            try:
+                                output_path, _mime = pollinations_image(generation_prompt, output_stem, edit_seed)
+                            except Exception:
+                                output_path, _mime = local_image_fallback(generation_prompt, output_stem)
 
                 extension = ".png" if valid_image_file(output_path) == "image/png" else ".jpg"
                 final_path = output_path.with_suffix(extension)
@@ -2108,6 +2586,15 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             current_date = datetime.now().strftime("%B %d, %Y")
             ai_name = re.sub(r"[\r\n\x00-\x1f]", " ", str(payload.get("ai_name") or "Northstar")).strip()[:60] or "Northstar"
             user_name = re.sub(r"[\r\n\x00-\x1f]", " ", str(payload.get("user_name") or "")).strip()[:60]
+            access_token = self.headers.get("X-Access-Token", "").strip()
+            is_admin_request = self._is_admin_session(access_token)
+            correction_statement = _admin_correction_text(user_prompt)
+            if is_admin_request and correction_statement:
+                _store_global_correction(correction_statement)
+                greeting_name = user_name.strip()
+                acknowledgement = f"Sorry {greeting_name}, I’ve updated my knowledge and will use your correction in future answers." if greeting_name else "Thanks for the correction. I’ve updated my knowledge and will use it in future answers."
+                emit_assistant_response(acknowledgement)
+                return
             if is_simple_greeting(user_prompt, ai_name):
                 emit_assistant_response(simple_greeting_reply(user_prompt, ai_name))
                 return
@@ -2119,12 +2606,13 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             visitor_context = _ip_location(self._visitor_ip(), self.headers.get("Accept-Language", "en"))
             locale_context = ("Visitor context from IP geolocation: " + json.dumps({key: visitor_context.get(key) for key in ("city", "country", "timezone", "language") if visitor_context.get(key)}, ensure_ascii=False) + ". Adapt local facts naturally, and answer in the preferred language when clear from the Accept-Language preference.")
             dated_system_prompt = f"{NORTHSTAR_SYSTEM_PROMPT}\n{personalization}\nCurrent date: {current_date}. Use this date when interpreting words like today, recent, and current. {locale_context}"
-            access_token = self.headers.get("X-Access-Token", "").strip()
-            is_admin_request = bool(access_token and hmac.compare_digest(access_token, ADMIN_CODE))
             if is_admin_request:
                 dated_system_prompt += "\n[ADMIN SYSTEM DIAGNOSTICS]\n" + json.dumps(self._admin_diagnostics(), ensure_ascii=False) + "\nFor this Admin only, answer questions about site health, logs, code, errors, and feature changes thoroughly and accurately. Never expose these diagnostics, internal code, secrets, or operational details to regular users."
             else:
                 dated_system_prompt += "\nDo not disclose internal Northstar site diagnostics, private logs, account/payment records, credentials, or implementation details. You may answer general programming questions, but do not claim access to private site operations."
+            corrections = _matching_global_corrections(user_prompt)
+            if corrections:
+                dated_system_prompt += "\n[ADMIN GLOBAL KNOWLEDGE OVERRIDES] The following Admin-provided corrections are authoritative for matching questions; apply them directly and do not contradict them with stale training data: " + json.dumps(corrections, ensure_ascii=False)
             study_mode = str(payload.get("study_mode", "")).strip().lower()
             mode_instructions = {
                 "quiz": "Create exactly five multiple-choice questions. For each use this exact line-based format: Q1: question, then A) option, B) option, C) option, D) option, Answer: X, Explanation: short reason, with each field on its own line. Repeat Q2 through Q5. Use one correct answer and plausible distractors so the options can be made interactive.",
@@ -2217,7 +2705,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             if OPENROUTER_API_KEY:
                 preferred_models = DEEP_REASONING_MODELS if deep_reasoning else FAST_STUDY_MODELS
                 remaining_models = FAST_STUDY_MODELS if deep_reasoning else DEEP_REASONING_MODELS
-                models = list(dict.fromkeys(preferred_models + remaining_models))
+                models = list(dict.fromkeys(preferred_models + remaining_models + discover_openrouter_free_models()))
                 openrouter_messages = []
                 for message in messages:
                     content = message.get("content", "")
@@ -2252,7 +2740,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                         method="POST",
                     )
                     try:
-                        upstream = urlopen(request, timeout=35)
+                        upstream = urlopen(request, timeout=8)
                         break
                     except HTTPError as exc:
                         last_retryable_error = exc
@@ -2282,7 +2770,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                         upstream.close()
                     return
                 try:
-                    upstream.fp.raw._sock.settimeout(None)
+                    upstream.fp.raw._sock.settimeout(8)
                 except (AttributeError, OSError):
                     pass
                 think_filter = ThinkTagStreamFilter()
@@ -2360,7 +2848,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             body = json.dumps(payload).encode("utf-8")
             request = Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
             try:
-                upstream = urlopen(request, timeout=35)
+                upstream = urlopen(request, timeout=8)
             except (URLError, TimeoutError, socket.timeout) as exc:
                 reason = getattr(exc, "reason", exc)
                 if isinstance(reason, (TimeoutError, socket.timeout)):
@@ -2381,7 +2869,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             # The 35-second limit is only for Ollama's initial response. Once
             # streaming starts, allow long answers to continue without a socket timeout.
             try:
-                upstream.fp.raw._sock.settimeout(None)
+                upstream.fp.raw._sock.settimeout(8)
             except (AttributeError, OSError):
                 pass
             stream_cleaner = {"at_start": True, "pending_marker": "", "pending_role": ""}
