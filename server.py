@@ -8,7 +8,7 @@ from urllib.parse import quote, urlparse, urljoin, parse_qs
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
 from urllib.parse import urlencode
 from html.parser import HTMLParser
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 import zlib
 import struct
 import base64
@@ -669,57 +669,40 @@ def _wikipedia_search(query):
 
 
 def web_search(query):
-    """Search DDG and Wikipedia, then read explicit URLs and top result pages."""
+    """Return fast DDG/Wikipedia snippets, reading pages only for URLs the user supplied."""
     query = str(query or "").strip()
     explicit_urls = _extract_explicit_urls(query)
-    results = []
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        duck_future = pool.submit(_duckduckgo_search, query) if query else None
-        wiki_future = pool.submit(_wikipedia_search, query) if query else None
-        page_futures = {pool.submit(fetch_webpage, url, 6, 4000): url for url in explicit_urls}
-        try:
-            duck_results = duck_future.result() if duck_future else []
-        except Exception:
-            duck_results = []
-        try:
-            wiki_results = wiki_future.result() if wiki_future else []
-        except Exception:
-            wiki_results = []
-        if duck_results:
-            results.extend(duck_results)
-        seen = {item.get("url") for item in results}
-        for item in wiki_results:
-            if item.get("url") not in seen:
-                results.append(item)
-                seen.add(item.get("url"))
-        pages = []
-        for future in as_completed(page_futures):
-            url = page_futures[future]
+    pool = ThreadPoolExecutor(max_workers=max(2, min(4, len(explicit_urls) + 2)))
+    jobs = {}
+    if query:
+        jobs[pool.submit(_duckduckgo_search, query)] = "snippets"
+        jobs[pool.submit(_wikipedia_search, query)] = "snippets"
+    for url in explicit_urls:
+        jobs[pool.submit(fetch_webpage, url, 3, 4000)] = "page"
+    results, pages = [], []
+    deadline = time.monotonic() + 3.8
+    try:
+        for future in as_completed(jobs, timeout=max(0.01, deadline - time.monotonic())):
             try:
-                page = future.result()
-                if page:
-                    pages.append(page)
+                value = future.result()
+                if jobs[future] == "page":
+                    if value:
+                        pages.append(value)
+                elif value:
+                    results.extend(value if isinstance(value, list) else [value])
             except Exception:
                 continue
-
-    page_urls = {page["url"] for page in pages}
-    result_urls = []
+    except FuturesTimeoutError:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    deduped, seen = [], set()
     for item in results:
-        url = item.get("url", "")
-        if url and url not in page_urls and url not in result_urls:
-            result_urls.append(url)
-        if len(result_urls) >= 3:
-            break
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(fetch_webpage, url, 6, 4000): url for url in result_urls}
-        for future in as_completed(futures):
-            try:
-                page = future.result()
-                if page:
-                    pages.append(page)
-            except Exception:
-                continue
-    return {"results": results[:8], "pages": pages}
+        url = item.get("url")
+        if url and url not in seen:
+            deduped.append(item)
+            seen.add(url)
+    return {"results": deduped[:8], "pages": pages}
 
 
 LIVE_FACTS_RE = re.compile(
@@ -1170,6 +1153,21 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             if any(not isinstance(message, dict) for message in messages):
                 self._json(400, {"error": "Each message must be an object."})
                 return
+            stream_requested = bool(payload.get("stream", True))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            stream_started = True
+            def emit_chat_error(message):
+                try:
+                    self.wfile.write((json.dumps({"error": str(message)}, ensure_ascii=False) + "\n").encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+            self.wfile.write(b'{"status":"thinking"}\n')
+            self.wfile.flush()
             user_prompt = next(
                 (str(message.get("content", "")) for message in reversed(messages)
                  if message.get("role") == "user"),
@@ -1270,7 +1268,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     openrouter_body = json.dumps({
                         "model": model_name,
                         "messages": openrouter_messages,
-                        "stream": True,
+                        "stream": stream_requested,
                         "temperature": 0.7,
                     }).encode("utf-8")
                     request = Request(
@@ -1295,38 +1293,46 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 if upstream is None:
                     raise last_retryable_error or RuntimeError("No working OpenRouter model was available.")
 
-                self.send_response(upstream.status)
-                self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("X-Accel-Buffering", "no")
-                self.end_headers()
-                stream_started = True
+                if not stream_requested:
+                    try:
+                        result = json.loads(upstream.read())
+                        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        self.wfile.write((json.dumps({"message": {"content": content}, "done": False}, ensure_ascii=False) + "\n").encode("utf-8"))
+                        self.wfile.write(b'{"message":{"content":""},"done":true}\n')
+                        self.wfile.flush()
+                    finally:
+                        upstream.close()
+                    return
                 try:
                     upstream.fp.raw._sock.settimeout(None)
                 except (AttributeError, OSError):
                     pass
-                for raw_line in upstream:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        event = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = event.get("choices") or []
-                    delta = (choices[0].get("delta") or {}).get("content") if choices else None
-                    if isinstance(delta, list):
-                        delta = "".join(part.get("text", "") for part in delta if isinstance(part, dict))
-                    if delta:
-                        chunk = {"message": {"content": delta}, "done": False}
-                        self.wfile.write((json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8"))
-                        self.wfile.flush()
-                self.wfile.write(b'{"message":{"content":""},"done":true}\n')
-                self.wfile.flush()
-                upstream.close()
+                try:
+                    for raw_line in upstream:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = event.get("choices") or []
+                        delta = (choices[0].get("delta") or {}).get("content") if choices else None
+                        if isinstance(delta, list):
+                            delta = "".join(part.get("text", "") for part in delta if isinstance(part, dict))
+                        if delta:
+                            chunk = {"message": {"content": delta}, "done": False}
+                            self.wfile.write((json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8"))
+                            self.wfile.flush()
+                    self.wfile.write(b'{"message":{"content":""},"done":true}\n')
+                    self.wfile.flush()
+                except (HTTPError, URLError, TimeoutError, socket.timeout, OSError) as exc:
+                    emit_chat_error(f"OpenRouter stream ended unexpectedly: {exc}")
+                finally:
+                    upstream.close()
                 return
 
             if has_images:
@@ -1335,13 +1341,13 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 vision = next((candidate for candidate in ("moondream", "llava", "minicpm-v", "llama3.2-vision")
                                if any(name == candidate or name.startswith(candidate + ":") for name in names)), None)
                 if not vision:
-                    self._json(400, {"error": "No local vision model is installed yet. Open Terminal and run: ollama pull moondream"})
+                    emit_chat_error("No local vision model is installed yet. Open Terminal and run: ollama pull moondream")
                     return
                 payload["model"] = next(m["name"] for m in available if m.get("name", "").lower().startswith(vision))
             available = self._ollama_models()
             available_names = [str(model.get("name", "")).strip() for model in available]
             if not available_names:
-                self._json(503, {"error": "No Ollama models are installed. Install a study model and try again."})
+                emit_chat_error("No Ollama models are installed. Install a study model and try again.")
                 return
             requested_model = str(payload.get("model", "")).strip()
             requested_base, _, requested_tag = requested_model.lower().partition(":")
@@ -1358,7 +1364,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 print(f"Requested Ollama model {requested_model or '(none)'} is unavailable; using {payload['model']}.")
             else:
                 payload["model"] = installed_model
-            payload["stream"] = True
+            payload["stream"] = stream_requested
             payload["keep_alive"] = "24h"
             payload["options"] = {
                 "num_ctx": 8192,
@@ -1372,12 +1378,19 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             except (URLError, TimeoutError, socket.timeout) as exc:
                 reason = getattr(exc, "reason", exc)
                 if isinstance(reason, (TimeoutError, socket.timeout)):
-                    self._json(504, {
-                        "error": "Ollama did not start responding within 180 seconds. "
-                                 "Check that Ollama is running and the selected model is available."
-                    })
+                    emit_chat_error("Ollama did not start responding within 180 seconds. Check that Ollama is running and the selected model is available.")
                 else:
-                    self._json(502, {"error": f"Could not reach Ollama at {OLLAMA_URL}: {exc}"})
+                    emit_chat_error(f"Could not reach Ollama at {OLLAMA_URL}: {exc}")
+                return
+            if not stream_requested:
+                try:
+                    result = json.loads(upstream.read())
+                    content = result.get("message", {}).get("content", result.get("response", ""))
+                    self.wfile.write((json.dumps({"message": {"content": content}, "done": False}, ensure_ascii=False) + "\n").encode("utf-8"))
+                    self.wfile.write(b'{"message":{"content":""},"done":true}\n')
+                    self.wfile.flush()
+                finally:
+                    upstream.close()
                 return
             # The 180-second limit is only for Ollama's initial response. Once
             # streaming starts, allow long answers to continue without a socket timeout.
@@ -1385,12 +1398,6 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 upstream.fp.raw._sock.settimeout(None)
             except (AttributeError, OSError):
                 pass
-            self.send_response(upstream.status)
-            self.send_header("Content-Type", upstream.headers.get("Content-Type", "application/x-ndjson"))
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            stream_started = True
             stream_cleaner = {"at_start": True, "pending_marker": "", "pending_role": ""}
             while True:
                 # Ollama emits one NDJSON object per generated chunk. Relay each
@@ -1403,25 +1410,34 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             upstream.close()
         except HTTPError as exc:
             detail = exc.read()
-            self.send_response(exc.code)
-            self.send_header("Content-Type", exc.headers.get("Content-Type", "application/json"))
-            self.send_header("Content-Length", str(len(detail)))
-            self.end_headers()
-            self.wfile.write(detail)
-        except TimeoutError:
-            return
-        except (URLError, BrokenPipeError, ConnectionResetError) as exc:
+            if stream_started:
+                try:
+                    parsed = json.loads(detail)
+                    emit_chat_error(parsed.get("error", {}).get("message", str(parsed)))
+                except (ValueError, AttributeError, TypeError):
+                    emit_chat_error(f"Upstream request failed with HTTP {exc.code}.")
+            else:
+                self.send_response(exc.code)
+                self.send_header("Content-Type", exc.headers.get("Content-Type", "application/json"))
+                self.send_header("Content-Length", str(len(detail)))
+                self.end_headers()
+                self.wfile.write(detail)
+        except TimeoutError as exc:
+            if stream_started:
+                emit_chat_error(f"The response timed out: {exc}")
+        except (URLError, BrokenPipeError, ConnectionResetError, OSError) as exc:
             if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
                 return
             error = {"error": f"Could not reach Ollama at {OLLAMA_URL}: {exc}"}
             if stream_started:
-                try:
-                    self.wfile.write((json.dumps(error) + "\n").encode("utf-8"))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
+                emit_chat_error(error["error"])
             else:
                 self._json(502, error)
+        except Exception as exc:
+            if stream_started:
+                emit_chat_error(f"Chat request failed: {exc}")
+            else:
+                self._json(500, {"error": f"Chat request failed: {exc}"})
 
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
