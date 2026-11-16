@@ -34,14 +34,11 @@ PORT = int(os.environ.get("PORT", "8080"))
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 OLLAMA_MODELS_CACHE = {"expires": 0.0, "models": []}
 OLLAMA_MODELS_LOCK = threading.Lock()
-OPENROUTER_FREE_MODELS_CACHE = {"expires": 0.0, "models": []}
-OPENROUTER_FREE_MODELS_LOCK = threading.Lock()
 OPENROUTER_FALLBACK_MODELS = [
     "openrouter/free",
     "meta-llama/llama-3.3-70b-instruct:free",
     "mistralai/mistral-small-3.1-24b-instruct:free",
     "google/gemma-3-27b-it:free",
-    "cognitivecomputations/dolphin-mistral-24b-venice-edition",
 ]
 ROOT = Path(__file__).resolve().parent
 BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
@@ -87,29 +84,6 @@ def load_local_env():
             value = value.strip().strip('"').strip("'")
             if not os.environ.get(name.strip()):
                 os.environ[name.strip()] = value
-
-
-def openrouter_discovered_free_models():
-    """Read free model IDs from OpenRouter's public catalog, caching for 10 minutes."""
-    now = time.monotonic()
-    with OPENROUTER_FREE_MODELS_LOCK:
-        if now < OPENROUTER_FREE_MODELS_CACHE["expires"]:
-            return list(OPENROUTER_FREE_MODELS_CACHE["models"])
-        try:
-            request = Request("https://openrouter.ai/api/v1/models", headers={"User-Agent": "Northstar/1.0"})
-            with urlopen(request, timeout=8) as response:
-                catalog = json.loads(response.read(5_000_000))
-            models = list(dict.fromkeys(
-                item.get("id", "") for item in catalog.get("data", [])
-                if isinstance(item, dict) and str(item.get("id", "")).endswith(":free")
-            ))
-            models = [model for model in models if model]
-            OPENROUTER_FREE_MODELS_CACHE.update(expires=now + 600, models=models)
-            return models
-        except (HTTPError, URLError, TimeoutError, OSError, UnicodeError):
-            # Keep serving the configured fallback chain when discovery is unavailable.
-            OPENROUTER_FREE_MODELS_CACHE["expires"] = now + 60
-            return list(OPENROUTER_FREE_MODELS_CACHE["models"])
 
 
 load_local_env()
@@ -1247,9 +1221,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     has_images = True
 
             if OPENROUTER_API_KEY:
-                models = list(dict.fromkeys(
-                    OPENROUTER_FALLBACK_MODELS + openrouter_discovered_free_models()
-                ))
+                models = OPENROUTER_FALLBACK_MODELS
                 openrouter_messages = []
                 for message in messages:
                     content = message.get("content", "")
