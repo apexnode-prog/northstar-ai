@@ -108,7 +108,7 @@ if SUPABASE_URL.endswith("/rest/v1"):
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 
 
-def _supabase_request(method, path, body=None, prefer=None):
+def _supabase_request(method, path, body=None, prefer=None, timeout=12):
     """Small PostgREST client using only urllib; local JSON remains the no-key fallback."""
     if not SUPABASE_KEY:
         raise RuntimeError("Supabase is not configured.")
@@ -125,22 +125,22 @@ def _supabase_request(method, path, body=None, prefer=None):
         headers["Prefer"] = "return=representation,resolution=merge-duplicates"
     request_body = None if body is None else json.dumps(body).encode("utf-8")
     request = Request(url, data=request_body, headers=headers, method=method.upper())
-    with urlopen(request, timeout=12) as response:
+    with urlopen(request, timeout=timeout) as response:
         content = response.read()
     return json.loads(content.decode("utf-8")) if content else None
 
 
-def _user_query(email):
+def _user_query(email, timeout=12):
     query = urlencode({"email": f"eq.{email}"})
-    return _supabase_request("GET", f"northstar_users?{query}")
+    return _supabase_request("GET", f"northstar_users?{query}", timeout=timeout)
 
 
-def get_user_record(email):
+def get_user_record(email, timeout=12):
     email = normalize_email(email)
     if not email:
         return None
     if SUPABASE_KEY:
-        rows = _user_query(email) or []
+        rows = _user_query(email, timeout=timeout) or []
         return rows[0] if rows else None
     verified = email in load_verified_users()
     used = load_email_usage().get(email, 0)
@@ -154,7 +154,7 @@ def get_user_record(email):
     } if verified or paid else None
 
 
-def upsert_user_record(email, fields):
+def upsert_user_record(email, fields, timeout=12):
     email = normalize_email(email)
     if not email:
         raise ValueError("A valid email is required.")
@@ -164,10 +164,15 @@ def upsert_user_record(email, fields):
         rows = _supabase_request(
             "POST", f"northstar_users?{query}", [record],
             prefer="return=representation,resolution=merge-duplicates",
+            timeout=timeout,
         ) or []
         if rows:
-            return rows[0]
-        return get_user_record(email) or record
+            result = rows[0]
+        else:
+            result = get_user_record(email, timeout=timeout) or record
+        if fields.get("paid") and fields.get("txid"):
+            save_local_paid_user(email, fields["txid"])
+        return result
 
     if "verified" in fields and fields["verified"]:
         verified = load_verified_users()
@@ -180,44 +185,61 @@ def upsert_user_record(email, fields):
         usage[email] = max(0, int(fields["messages_used"]))
         save_email_usage(usage)
     if fields.get("paid") and fields.get("txid"):
-        paid = load_paid_users()
-        paid[email] = {"txid": str(fields["txid"]).lower(), "paid_at": datetime.now().astimezone().isoformat()}
-        temporary = PAID_USERS.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(paid, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(PAID_USERS)
+        save_local_paid_user(email, fields["txid"])
     return get_user_record(email) or record
+
+
+def save_local_paid_user(email, txid):
+    paid = load_paid_users()
+    paid[email] = {"txid": str(txid).strip().lower(), "paid_at": datetime.now().astimezone().isoformat()}
+    temporary = PAID_USERS.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(paid, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(PAID_USERS)
+
+
+def redeemed_txid_owner(txid, timeout=4):
+    normalized = str(txid or "").strip().lower()
+    owners = set()
+    remote_found = False
+    found = normalized in load_redeemed()
+    for owner, record in load_paid_users().items():
+        if str(record.get("txid", "")).strip().lower() == normalized:
+            found = True
+            owners.add(normalize_email(owner) or str(owner).lower())
+    if SUPABASE_KEY:
+        query = urlencode({"txid": f"eq.{normalized}", "select": "txid,email", "limit": "1"})
+        rows = _supabase_request("GET", f"northstar_redeemed_txids?{query}", timeout=timeout) or []
+        if rows:
+            found = True
+            remote_found = True
+            owner = normalize_email(rows[0].get("email"))
+            if owner:
+                owners.add(owner)
+    return found, owners, remote_found
 
 
 def redeemed_txid_exists(txid):
     normalized = str(txid or "").strip().lower()
     if not normalized:
         return False
-    if SUPABASE_KEY:
-        query = urlencode({"txid": f"eq.{normalized}", "select": "txid", "limit": "1"})
-        return bool(_supabase_request("GET", f"northstar_redeemed_txids?{query}") or [])
-    return normalized in load_redeemed() or any(
-        str(record.get("txid", "")).strip().lower() == normalized
-        for record in load_paid_users().values()
-    )
+    return redeemed_txid_owner(normalized)[0]
 
 
 def insert_redeemed_txid(txid, email):
     txid = str(txid).strip().lower()
     email = normalize_email(email)
     if SUPABASE_KEY:
-        # A unique txid constraint is required on the table. Plain INSERT surfaces
-        # a 409 conflict instead of overwriting the account that redeemed it first.
+        # A unique txid constraint makes this insert an atomic cross-worker claim.
         query = urlencode({"select": "txid"})
         rows = _supabase_request(
             "POST", f"northstar_redeemed_txids?{query}", [{"txid": txid, "email": email}],
-            prefer="return=representation",
+            prefer="return=representation", timeout=1.5,
         )
         if not rows:
             raise ValueError("That transaction ID has already been redeemed.")
-        return
     with REDEEM_LOCK:
         used = load_redeemed()
-        if txid in used:
+        if txid in used and not SUPABASE_KEY:
             raise ValueError("That transaction ID has already been redeemed.")
         used.add(txid)
         temporary = REDEEMED_TXIDS.with_suffix(".json.tmp")
@@ -264,16 +286,22 @@ class _IPv4HTTPSConnection(http.client.HTTPSConnection):
     """Prefer IPv4 HTTPS routes, falling back to IPv6 only when IPv4 is unreachable."""
     def connect(self):
         last_error = None
+        deadline = time.monotonic() + max(0.1, float(self.timeout or 5))
         for family in (socket.AF_INET, socket.AF_INET6):
+            if time.monotonic() >= deadline:
+                break
             try:
                 addresses = socket.getaddrinfo(self.host, self.port, family=family, type=socket.SOCK_STREAM)
             except OSError as exc:
                 last_error = exc
                 continue
             for resolved_family, socktype, proto, _canonname, address in addresses:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 sock = socket.socket(resolved_family, socktype, proto)
                 try:
-                    sock.settimeout(self.timeout)
+                    sock.settimeout(remaining)
                     sock.connect(address)
                     self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
                     return
@@ -299,14 +327,27 @@ def _fetch_json_ipv4(url, timeout=15):
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
+    deadline = time.monotonic() + timeout
     try:
         connection.request("GET", path, headers={
             "User-Agent": "Northstar/1.0",
             "Accept": "application/json",
             "Connection": "close",
         })
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Bitcoin service request exceeded its time limit.")
+        if connection.sock:
+            connection.sock.settimeout(remaining)
         response = connection.getresponse()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Bitcoin service request exceeded its time limit.")
+        if connection.sock:
+            connection.sock.settimeout(remaining)
         raw = response.read(2_000_000)
+        if time.monotonic() > deadline:
+            raise TimeoutError("Bitcoin service request exceeded its time limit.")
         if not 200 <= response.status < 300:
             raise HTTPError(url, response.status, response.reason, response.headers, io.BytesIO(raw))
         return json.loads(raw.decode("utf-8"))
@@ -320,15 +361,26 @@ def btc_usd_price():
         ("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", lambda data: float(data["bitcoin"]["usd"])),
         ("https://mempool.space/api/v1/prices", lambda data: float(data["USD"])),
     )
+    executor = ThreadPoolExecutor(max_workers=3)
+    futures = {
+        executor.submit(lambda u=url, fn=extract: fn(_fetch_json_ipv4(u, timeout=5))): url
+        for url, extract in price_sources
+    }
     errors = []
-    for url, extract_price in price_sources:
-        try:
-            price = extract_price(_fetch_json_ipv4(url, timeout=15))
-            if price > 0:
-                return price
-            raise ValueError("Price API returned a non-positive BTC price.")
-        except Exception as exc:
-            errors.append(exc)
+    try:
+        for future in as_completed(futures, timeout=5):
+            try:
+                price = float(future.result())
+                if price > 0:
+                    return price
+            except Exception as exc:
+                errors.append(exc)
+    except FuturesTimeoutError:
+        pass
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
     raise RuntimeError("All Bitcoin price sources are unavailable.") from (errors[-1] if errors else None)
 
 
@@ -370,6 +422,59 @@ def bitcoin_transaction_received(txid):
     if errors:
         raise errors[-1]
     raise RuntimeError("No Bitcoin explorer returned transaction data.")
+
+
+def verify_bitcoin_outputs_parallel(txid, threshold_usd=1.80, timeout=5):
+    """Fetch live BTC prices and four explorers concurrently; accept the first payable result."""
+    price_tasks = (
+        ("https://api.coinbase.com/v2/prices/BTC-USD/spot", lambda value: float(value["data"]["amount"])),
+        ("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", lambda value: float(value["bitcoin"]["usd"])),
+        ("https://mempool.space/api/v1/prices", lambda value: float(value["USD"])),
+    )
+    explorer_tasks = (
+        (f"https://blockstream.info/api/tx/{txid}",
+         lambda value: sum(int(out.get("value", 0)) for out in value.get("vout", [])
+                           if out.get("scriptpubkey_address") == BTC_ADDRESS)),
+        (f"https://mempool.space/api/tx/{txid}",
+         lambda value: sum(int(out.get("value", 0)) for out in value.get("vout", [])
+                           if out.get("scriptpubkey_address") == BTC_ADDRESS)),
+        (f"https://api.blockcypher.com/v1/btc/main/txs/{txid}",
+         lambda value: sum(int(out.get("value", 0)) for out in value.get("outputs", [])
+                           if BTC_ADDRESS in out.get("addresses", []))),
+        (f"https://blockchain.info/rawtx/{txid}?format=json",
+         lambda value: sum(int(out.get("value", 0)) for out in value.get("out", [])
+                           if out.get("addr") == BTC_ADDRESS)),
+    )
+    executor = ThreadPoolExecutor(max_workers=5)
+    futures = {}
+    for url, extract in explorer_tasks:
+        futures[executor.submit(lambda u=url, fn=extract: fn(_fetch_json_ipv4(u, timeout=timeout)))] = "explorer"
+    for url, extract in price_tasks:
+        futures[executor.submit(lambda u=url, fn=extract: fn(_fetch_json_ipv4(u, timeout=timeout)))] = "price"
+    price = None
+    outputs = []
+    try:
+        for future in as_completed(futures, timeout=timeout):
+            try:
+                result = future.result()
+            except Exception:
+                continue
+            if futures[future] == "price":
+                if isinstance(result, (int, float)) and result > 0:
+                    price = float(result)
+            elif isinstance(result, (int, float)) and result >= 0:
+                outputs.append(int(result))
+            if price:
+                for satoshis in outputs:
+                    if satoshis * price / 100_000_000 >= threshold_usd:
+                        return satoshis, price
+    except FuturesTimeoutError:
+        pass
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+    raise TimeoutError("Bitcoin price and explorer checks did not confirm the payment within five seconds.")
 
 
 def load_redeemed():
@@ -1118,6 +1223,24 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_response(self, code, message=None):
+        self._northstar_response_started = True
+        super().send_response(code, message)
+
+    def do_GET(self):
+        self._northstar_response_started = False
+        try:
+            self._do_GET()
+        except Exception as exc:
+            print(f"Unhandled GET route error for {self.path}: {exc}")
+            if not self._northstar_response_started and self.path.startswith("/api/"):
+                self._json(500, {"error": "The request could not be completed. Please retry shortly."})
+            else:
+                self.close_connection = True
+
+    def _do_GET(self):
+        return self._handle_get()
+
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -1195,7 +1318,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 used = load_ip_usage().get(value, 0)
         return {"used": used, "remaining": max(0, FREE_TRIAL_LIMIT - used)}
 
-    def do_GET(self):
+    def _handle_get(self):
         route = self.path.split("?", 1)[0]
         if route == "/api/trial-status":
             try:
@@ -1215,6 +1338,29 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
+        self._northstar_response_started = False
+        self._northstar_streaming = False
+        try:
+            self._do_POST()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as exc:
+            print(f"Unhandled POST route error for {self.path}: {exc}")
+            if self._northstar_streaming and self._northstar_response_started:
+                try:
+                    self.wfile.write(b'{"error":"The request could not be completed. Please retry shortly.","done":true}\n')
+                    self.wfile.flush()
+                except OSError:
+                    pass
+            elif not self._northstar_response_started and self.path.startswith("/api/"):
+                try:
+                    self._json(500, {"error": "The request could not be completed. Please retry shortly."})
+                except OSError:
+                    self.close_connection = True
+            else:
+                self.close_connection = True
+
+    def _do_POST(self):
         route = self.path.split("?", 1)[0]
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -1407,43 +1553,73 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 return
             email = normalize_email(payload.get("email") or self.headers.get("X-User-Email", ""))
             try:
-                if txid and redeemed_txid_exists(txid):
-                    self._json(200, {"verified": False, "error": "This transaction ID has already been redeemed and cannot be used on another account."})
-                    return
+                account = None
+                if txid:
+                    lookup_pool = ThreadPoolExecutor(max_workers=2)
+                    lookup_deadline = time.monotonic() + 4
+                    duplicate_future = lookup_pool.submit(redeemed_txid_owner, txid, 4)
+                    account_future = lookup_pool.submit(get_user_record, email, 4) if email else None
+                    try:
+                        already_used, owners, remote_found = duplicate_future.result(timeout=4)
+                        if account_future:
+                            remaining_lookup = max(0, lookup_deadline - time.monotonic())
+                            account = account_future.result(timeout=remaining_lookup)
+                    finally:
+                        lookup_pool.shutdown(wait=False, cancel_futures=True)
+                    if already_used:
+                        if email and owners == {email}:
+                            if SUPABASE_KEY and not remote_found:
+                                try:
+                                    insert_redeemed_txid(txid, email)
+                                except HTTPError as exc:
+                                    if exc.code != 409:
+                                        raise
+                                    already_used, owners, _remote_found = redeemed_txid_owner(txid, timeout=4)
+                                    if not already_used or owners != {email}:
+                                        self._json(400, {"verified": False, "error": "This transaction ID has already been redeemed on another account."})
+                                        return
+                            upsert_user_record(email, {"verified": True, "paid": True, "txid": txid}, timeout=1.5)
+                            self._json(200, {"verified": True, "paid": True, "email": email})
+                        else:
+                            self._json(400, {"verified": False, "error": "This transaction ID has already been redeemed on another account."})
+                        return
                 if txid and not email:
                     self._json(400, {"verified": False, "error": "Sign in with a verified email before linking a Bitcoin payment."})
                     return
                 if txid:
-                    account = get_user_record(email)
                     if not account or not account.get("verified"):
                         self._json(401, {"verified": False, "error": "Verify your email before linking a Bitcoin payment."})
                         return
-                price = btc_usd_price()
-                quote_btc = 2.0 / price
                 if not txid:
+                    price = btc_usd_price()
+                    quote_btc = 2.0 / price
                     self._json(200, {"price_usd": price, "btc_due": quote_btc, "address": BTC_ADDRESS})
                     return
-                received = bitcoin_transaction_received(txid)
-                if received * price / 100_000_000 < 1.85:
-                    self._json(200, {"verified": False, "error": "This transaction does not show at least $1.85 USD sent to the access address."})
+                received, price = verify_bitcoin_outputs_parallel(txid, threshold_usd=1.80, timeout=5)
+                if received * price / 100_000_000 < 1.80:
+                    self._json(200, {"verified": False, "error": "This transaction does not show at least $1.80 USD sent to the access address."})
                     return
                 try:
                     insert_redeemed_txid(txid, email)
                 except HTTPError as exc:
                     if exc.code == 409:
-                        self._json(200, {"verified": False, "error": "This transaction ID has already been redeemed and cannot be used on another account."})
+                        self._json(400, {"verified": False, "error": "This transaction ID has already been redeemed on another account."})
                         return
                     raise
                 except ValueError:
-                    self._json(200, {"verified": False, "error": "This transaction ID has already been redeemed and cannot be used on another account."})
+                    self._json(400, {"verified": False, "error": "This transaction ID has already been redeemed on another account."})
                     return
-                upsert_user_record(email, {"verified": True, "paid": True, "txid": txid})
-                self._json(200, {"verified": True, "paid": True})
+                upsert_user_record(email, {"verified": True, "paid": True, "txid": txid}, timeout=1.5)
+                self._json(200, {"verified": True, "paid": True, "email": email})
             except HTTPError as exc:
-                self._json(502 if exc.code >= 500 else 400, {"verified": False, "error": "The Bitcoin explorer could not find or verify that transaction."})
+                if SUPABASE_KEY and str(getattr(exc, "url", "")).startswith(SUPABASE_URL):
+                    self._json(503, {"verified": False, "error": "Account service is temporarily unavailable. Please retry shortly."})
+                else:
+                    self._json(502 if exc.code >= 500 else 400, {"verified": False, "error": "The Bitcoin explorer could not find or verify that transaction."})
             except Exception as exc:
                 print(f"Bitcoin verification services failed: {exc}")
-                self._json(502, {"verified": False, "error": "Bitcoin verification services are temporarily unavailable. Please retry shortly."})
+                message = "Account service is temporarily unavailable. Please retry shortly." if SUPABASE_KEY and ("Supabase" in str(exc) or isinstance(exc, HTTPError)) else "Bitcoin verification is taking longer than expected. Please retry shortly."
+                self._json(503, {"verified": False, "error": message})
             return
 
         if route == "/api/edit-image":
@@ -1669,6 +1845,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self._json(400, {"error": "Each message must be an object."})
                 return
             stream_requested = bool(payload.get("stream", True))
+            self._northstar_streaming = True
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
             self.send_header("Cache-Control", "no-cache, no-transform")
