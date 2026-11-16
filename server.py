@@ -39,6 +39,7 @@ OPENROUTER_FALLBACK_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "mistralai/mistral-small-3.1-24b-instruct:free",
     "google/gemma-3-27b-it:free",
+    "qwen/qwen-2.5-72b-instruct:free",
 ]
 ROOT = Path(__file__).resolve().parent
 BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
@@ -51,7 +52,7 @@ EMAIL_USAGE = ROOT / "email_usage.json"
 EMAIL_USAGE_LOCK = threading.Lock()
 FREE_TRIAL_LIMIT = 5
 NORTHSTAR_SYSTEM_PROMPT = (
-    "You are Northstar, a capable general-purpose assistant and supportive study partner. Match the "
+    "You are a capable general-purpose assistant and supportive study partner. Match the "
     "length and depth of each reply to what the user asks. For a casual greeting or short check-in, "
     "respond warmly and naturally in one or two concise sentences; do not add textbook filler, "
     "unsolicited disclaimers, or a long answer. Answer only the question asked, without extra background "
@@ -743,6 +744,33 @@ def should_search_web(query, enabled=True):
     return needs_live_search(query) or (bool(enabled) and bool(FACTUAL_OR_RESEARCH_RE.search(str(query or ""))))
 
 
+def fallback_search_answer(query):
+    """Create a readable, source-backed answer when every language model is unavailable."""
+    try:
+        research = web_search(str(query or "")[:12000])
+        items = list(research.get("results", []))
+        pages = list(research.get("pages", []))
+        lines = []
+        for page in pages[:3]:
+            title = str(page.get("title") or page.get("url") or "Source")[:180]
+            excerpt = re.sub(r"\s+", " ", str(page.get("text") or "")).strip()[:900]
+            if excerpt:
+                lines.append(f"- **{title}:** {excerpt} ({page.get('url', '')})")
+        for item in items[:5]:
+            title = re.sub(r"\s+", " ", str(item.get("title") or "Search result")).strip()[:180]
+            snippet = re.sub(r"\s+", " ", str(item.get("snippet") or "")).strip()[:700]
+            if snippet:
+                lines.append(f"- **{title}:** {snippet} ({item.get('url', '')})")
+        if lines:
+            return "I can’t reach the AI model right now, but here’s a quick summary from the available search sources:\n\n" + "\n".join(lines[:5])
+    except Exception:
+        pass
+    return (
+        "I’m temporarily unable to reach the AI service or retrieve reliable search results. "
+        "Please try again in a moment, or narrow the question to one part and I’ll help with that first."
+    )
+
+
 def extract_pdf(data):
     try:
         from pypdf import PdfReader
@@ -1160,21 +1188,30 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             stream_started = True
-            def emit_chat_error(message):
+            def emit_assistant_response(message):
                 try:
-                    self.wfile.write((json.dumps({"error": str(message)}, ensure_ascii=False) + "\n").encode("utf-8"))
+                    self.wfile.write((json.dumps({"message": {"content": str(message)}, "done": False}, ensure_ascii=False) + "\n").encode("utf-8"))
+                    self.wfile.write(b'{"message":{"content":""},"done":true}\n')
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
             self.wfile.write(b'{"status":"thinking"}\n')
             self.wfile.flush()
+            for message in messages:
+                if message.get("role") == "user" and isinstance(message.get("content"), str):
+                    message["content"] = message["content"][:12000]
             user_prompt = next(
                 (str(message.get("content", "")) for message in reversed(messages)
                  if message.get("role") == "user"),
                 str(payload.get("search_query", "")),
             )
             current_date = datetime.now().strftime("%B %d, %Y")
-            dated_system_prompt = f"{NORTHSTAR_SYSTEM_PROMPT}\nCurrent date: {current_date}. Use this date when interpreting words like today, recent, and current."
+            ai_name = re.sub(r"[\r\n\x00-\x1f]", " ", str(payload.get("ai_name") or "Northstar")).strip()[:60] or "Northstar"
+            user_name = re.sub(r"[\r\n\x00-\x1f]", " ", str(payload.get("user_name") or "")).strip()[:60]
+            personalization = f'Your assigned name is {json.dumps(ai_name, ensure_ascii=False)}.'
+            if user_name:
+                personalization += f' The user\'s preferred name is {json.dumps(user_name, ensure_ascii=False)}; use it naturally and sparingly.'
+            dated_system_prompt = f"{NORTHSTAR_SYSTEM_PROMPT}\n{personalization}\nCurrent date: {current_date}. Use this date when interpreting words like today, recent, and current."
             if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
                 messages[0]["content"] = dated_system_prompt + "\n\n" + str(messages[0].get("content", ""))
             else:
@@ -1207,7 +1244,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                             for page in pages
                         ))
                     context = "\n\n".join(context_parts)
-                except (HTTPError, URLError, TimeoutError, OSError):
+                except Exception:
                     context = f"Live web search was unavailable on {current_date}; state uncertainty about current facts."
                 if messages and messages[0].get("role") == "system":
                     messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + context
@@ -1283,15 +1320,20 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                         method="POST",
                     )
                     try:
-                        upstream = urlopen(request, timeout=180)
+                        upstream = urlopen(request, timeout=35)
                         break
                     except HTTPError as exc:
-                        if exc.code == 404 or exc.code == 429 or 500 <= exc.code <= 599:
-                            last_retryable_error = exc
+                        last_retryable_error = exc
+                        if exc.code in (400, 404, 429, 500, 502, 503):
                             continue
-                        raise
+                        break
+                    except (URLError, TimeoutError, socket.timeout, OSError) as exc:
+                        last_retryable_error = exc
+                        continue
                 if upstream is None:
-                    raise last_retryable_error or RuntimeError("No working OpenRouter model was available.")
+                    print(f"All OpenRouter models failed; returning search fallback: {last_retryable_error}")
+                    emit_assistant_response(fallback_search_answer(user_prompt))
+                    return
 
                 if not stream_requested:
                     try:
@@ -1330,7 +1372,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(b'{"message":{"content":""},"done":true}\n')
                     self.wfile.flush()
                 except (HTTPError, URLError, TimeoutError, socket.timeout, OSError) as exc:
-                    emit_chat_error(f"OpenRouter stream ended unexpectedly: {exc}")
+                    print(f"OpenRouter stream ended; returning search fallback: {exc}")
+                    emit_assistant_response(fallback_search_answer(user_prompt))
                 finally:
                     upstream.close()
                 return
@@ -1341,13 +1384,13 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 vision = next((candidate for candidate in ("moondream", "llava", "minicpm-v", "llama3.2-vision")
                                if any(name == candidate or name.startswith(candidate + ":") for name in names)), None)
                 if not vision:
-                    emit_chat_error("No local vision model is installed yet. Open Terminal and run: ollama pull moondream")
+                    emit_assistant_response(fallback_search_answer(user_prompt))
                     return
                 payload["model"] = next(m["name"] for m in available if m.get("name", "").lower().startswith(vision))
             available = self._ollama_models()
             available_names = [str(model.get("name", "")).strip() for model in available]
             if not available_names:
-                emit_chat_error("No Ollama models are installed. Install a study model and try again.")
+                emit_assistant_response(fallback_search_answer(user_prompt))
                 return
             requested_model = str(payload.get("model", "")).strip()
             requested_base, _, requested_tag = requested_model.lower().partition(":")
@@ -1374,13 +1417,13 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             body = json.dumps(payload).encode("utf-8")
             request = Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
             try:
-                upstream = urlopen(request, timeout=180)
+                upstream = urlopen(request, timeout=35)
             except (URLError, TimeoutError, socket.timeout) as exc:
                 reason = getattr(exc, "reason", exc)
                 if isinstance(reason, (TimeoutError, socket.timeout)):
-                    emit_chat_error("Ollama did not start responding within 180 seconds. Check that Ollama is running and the selected model is available.")
+                    emit_assistant_response(fallback_search_answer(user_prompt))
                 else:
-                    emit_chat_error(f"Could not reach Ollama at {OLLAMA_URL}: {exc}")
+                    emit_assistant_response(fallback_search_answer(user_prompt))
                 return
             if not stream_requested:
                 try:
@@ -1392,7 +1435,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 finally:
                     upstream.close()
                 return
-            # The 180-second limit is only for Ollama's initial response. Once
+            # The 35-second limit is only for Ollama's initial response. Once
             # streaming starts, allow long answers to continue without a socket timeout.
             try:
                 upstream.fp.raw._sock.settimeout(None)
@@ -1409,14 +1452,10 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self.wfile.flush()
             upstream.close()
         except HTTPError as exc:
-            detail = exc.read()
             if stream_started:
-                try:
-                    parsed = json.loads(detail)
-                    emit_chat_error(parsed.get("error", {}).get("message", str(parsed)))
-                except (ValueError, AttributeError, TypeError):
-                    emit_chat_error(f"Upstream request failed with HTTP {exc.code}.")
+                emit_assistant_response(fallback_search_answer(user_prompt))
             else:
+                detail = exc.read()
                 self.send_response(exc.code)
                 self.send_header("Content-Type", exc.headers.get("Content-Type", "application/json"))
                 self.send_header("Content-Length", str(len(detail)))
@@ -1424,18 +1463,19 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(detail)
         except TimeoutError as exc:
             if stream_started:
-                emit_chat_error(f"The response timed out: {exc}")
+                emit_assistant_response(fallback_search_answer(user_prompt))
         except (URLError, BrokenPipeError, ConnectionResetError, OSError) as exc:
             if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
                 return
             error = {"error": f"Could not reach Ollama at {OLLAMA_URL}: {exc}"}
             if stream_started:
-                emit_chat_error(error["error"])
+                emit_assistant_response(fallback_search_answer(user_prompt))
             else:
                 self._json(502, error)
         except Exception as exc:
             if stream_started:
-                emit_chat_error(f"Chat request failed: {exc}")
+                print(f"Chat request failed; returning search fallback: {exc}")
+                emit_assistant_response(fallback_search_answer(user_prompt))
             else:
                 self._json(500, {"error": f"Chat request failed: {exc}"})
 
