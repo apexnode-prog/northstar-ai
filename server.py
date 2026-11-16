@@ -29,8 +29,8 @@ import secrets
 import time
 from email.message import EmailMessage
 
-HOST = "127.0.0.1"
-PORT = 8080
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8080"))
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 OLLAMA_MODELS_CACHE = {"expires": 0.0, "models": []}
 OLLAMA_MODELS_LOCK = threading.Lock()
@@ -74,7 +74,7 @@ def load_local_env():
         if entry.startswith("export "):
             entry = entry[7:].strip()
         name, separator, value = entry.partition("=")
-        if separator and name.strip() in ("SMTP_EMAIL", "SMTP_APP_PASSWORD", "HF_TOKEN"):
+        if separator and name.strip() in ("SMTP_EMAIL", "SMTP_APP_PASSWORD", "HF_TOKEN", "OPENROUTER_API_KEY"):
             value = value.strip().strip('"').strip("'")
             if not os.environ.get(name.strip()):
                 os.environ[name.strip()] = value
@@ -84,6 +84,7 @@ load_local_env()
 SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "").strip()
 SMTP_APP_PASSWORD = os.environ.get("SMTP_APP_PASSWORD", "").replace(" ", "").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
 def normalize_email(value):
@@ -1212,6 +1213,96 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                             normalized.append(image)
                     message["images"] = normalized
                     has_images = True
+
+            if OPENROUTER_API_KEY:
+                requested_model = str(payload.get("model", "")).strip().lower()
+                preferred_model = (
+                    "nousresearch/hermes-3-llama-3.1-405b:free"
+                    if requested_model.startswith("dolphin-mistral")
+                    else "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"
+                )
+                models = [preferred_model]
+                models.extend(model for model in (
+                    "nousresearch/hermes-3-llama-3.1-405b:free",
+                    "mistralai/mistral-small-3.1-24b-instruct:free",
+                ) if model not in models)
+                openrouter_messages = []
+                for message in messages:
+                    content = message.get("content", "")
+                    images = message.get("images", [])
+                    if images:
+                        parts = [{"type": "text", "text": str(content)}] if content else []
+                        for image in images:
+                            if isinstance(image, str):
+                                image_url = image if image.startswith("data:") else f"data:image/jpeg;base64,{image}"
+                                parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                        content = parts
+                    openrouter_messages.append({"role": message.get("role", "user"), "content": content})
+
+                upstream = None
+                last_rate_limit = None
+                for model_name in models:
+                    openrouter_body = json.dumps({
+                        "model": model_name,
+                        "messages": openrouter_messages,
+                        "stream": True,
+                        "temperature": 0.7,
+                    }).encode("utf-8")
+                    request = Request(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        data=openrouter_body,
+                        headers={
+                            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                            "Content-Type": "application/json",
+                            "HTTP-Referer": "https://northstar.app",
+                            "X-Title": "Northstar",
+                        },
+                        method="POST",
+                    )
+                    try:
+                        upstream = urlopen(request, timeout=180)
+                        break
+                    except HTTPError as exc:
+                        if exc.code == 429:
+                            last_rate_limit = exc
+                            continue
+                        raise
+                if upstream is None:
+                    raise last_rate_limit or RuntimeError("All OpenRouter models are rate-limited.")
+
+                self.send_response(upstream.status)
+                self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                stream_started = True
+                try:
+                    upstream.fp.raw._sock.settimeout(None)
+                except (AttributeError, OSError):
+                    pass
+                for raw_line in upstream:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = event.get("choices") or []
+                    delta = (choices[0].get("delta") or {}).get("content") if choices else None
+                    if isinstance(delta, list):
+                        delta = "".join(part.get("text", "") for part in delta if isinstance(part, dict))
+                    if delta:
+                        chunk = {"message": {"content": delta}, "done": False}
+                        self.wfile.write((json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8"))
+                        self.wfile.flush()
+                self.wfile.write(b'{"message":{"content":""},"done":true}\n')
+                self.wfile.flush()
+                upstream.close()
+                return
 
             if has_images:
                 available = self._ollama_models()
