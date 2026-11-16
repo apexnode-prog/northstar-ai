@@ -13,6 +13,7 @@ import zlib
 import struct
 import base64
 import io
+import http.client
 import json
 import random
 import re
@@ -137,10 +138,116 @@ def load_verified_users():
     return verified
 
 
+class _IPv4HTTPSConnection(http.client.HTTPSConnection):
+    """Prefer IPv4 HTTPS routes, falling back to IPv6 only when IPv4 is unreachable."""
+    def connect(self):
+        last_error = None
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                addresses = socket.getaddrinfo(self.host, self.port, family=family, type=socket.SOCK_STREAM)
+            except OSError as exc:
+                last_error = exc
+                continue
+            for resolved_family, socktype, proto, _canonname, address in addresses:
+                sock = socket.socket(resolved_family, socktype, proto)
+                try:
+                    sock.settimeout(self.timeout)
+                    sock.connect(address)
+                    self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+                    return
+                except OSError as exc:
+                    last_error = exc
+                    sock.close()
+        if last_error:
+            raise last_error
+        raise OSError(f"No IPv4 address is available for {self.host}")
+
+
+def _fetch_json_ipv4(url, timeout=15):
+    """Fetch and decode JSON over HTTPS, preferring AF_INET to avoid broken IPv6 routes."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("An absolute HTTPS URL is required.")
+    connection = _IPv4HTTPSConnection(
+        parsed.hostname,
+        parsed.port or 443,
+        timeout=timeout,
+        context=ssl.create_default_context(),
+    )
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    try:
+        connection.request("GET", path, headers={
+            "User-Agent": "Northstar/1.0",
+            "Accept": "application/json",
+            "Connection": "close",
+        })
+        response = connection.getresponse()
+        raw = response.read(2_000_000)
+        if not 200 <= response.status < 300:
+            raise HTTPError(url, response.status, response.reason, response.headers, io.BytesIO(raw))
+        return json.loads(raw.decode("utf-8"))
+    finally:
+        connection.close()
+
+
 def btc_usd_price():
-    request = Request("https://mempool.space/api/v1/prices", headers={"User-Agent": "Northstar/1.0"})
-    with urlopen(request, timeout=15) as response:
-        return float(json.loads(response.read())["USD"])
+    price_sources = (
+        ("https://api.coinbase.com/v2/prices/BTC-USD/spot", lambda data: float(data["data"]["amount"])),
+        ("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", lambda data: float(data["bitcoin"]["usd"])),
+        ("https://mempool.space/api/v1/prices", lambda data: float(data["USD"])),
+    )
+    errors = []
+    for url, extract_price in price_sources:
+        try:
+            price = extract_price(_fetch_json_ipv4(url, timeout=15))
+            if price > 0:
+                return price
+            raise ValueError("Price API returned a non-positive BTC price.")
+        except Exception as exc:
+            errors.append(exc)
+    raise RuntimeError("All Bitcoin price sources are unavailable.") from (errors[-1] if errors else None)
+
+
+def bitcoin_transaction_received(txid):
+    """Return received satoshis, trying independent public explorers in order."""
+    explorers = (
+        (
+            f"https://blockstream.info/api/tx/{txid}",
+            lambda data: sum(
+                int(output.get("value", 0)) for output in data.get("vout", [])
+                if output.get("scriptpubkey_address") == BTC_ADDRESS
+            ) if isinstance(data.get("vout"), list) else None,
+        ),
+        (
+            f"https://mempool.space/api/tx/{txid}",
+            lambda data: sum(
+                int(output.get("value", 0)) for output in data.get("vout", [])
+                if output.get("scriptpubkey_address") == BTC_ADDRESS
+            ) if isinstance(data.get("vout"), list) else None,
+        ),
+        (
+            f"https://api.blockcypher.com/v1/btc/main/txs/{txid}",
+            lambda data: sum(
+                int(output.get("value", 0)) for output in data.get("outputs", [])
+                if BTC_ADDRESS in output.get("addresses", [])
+            ) if isinstance(data.get("outputs"), list) else None,
+        ),
+    )
+    errors = []
+    for url, extract_satoshis in explorers:
+        try:
+            transaction = _fetch_json_ipv4(url, timeout=15)
+            received = extract_satoshis(transaction)
+            if received is not None:
+                return received
+            errors.append(ValueError("Explorer returned an unexpected transaction format."))
+        except Exception as exc:
+            errors.append(exc)
+    if errors:
+        raise errors[-1]
+    raise RuntimeError("No Bitcoin explorer returned transaction data.")
 
 
 def load_redeemed():
@@ -1080,6 +1187,14 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self._json(200, {"verified": True, "admin": True})
                 return
             txid = (submitted_txid or submitted_code).lower()
+            if txid and not re.fullmatch(r"[0-9a-f]{64}", txid):
+                self._json(400, {"verified": False, "error": "Enter a valid 64-character Bitcoin transaction ID."})
+                return
+            if txid:
+                with REDEEM_LOCK:
+                    if txid in load_redeemed():
+                        self._json(200, {"verified": True, "previously_redeemed": True})
+                        return
             try:
                 price = btc_usd_price()
                 quote_btc = 2.0 / price
@@ -1096,21 +1211,18 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                         # reload; the access token is the same verified TXID.
                         self._json(200, {"verified": True, "previously_redeemed": True})
                         return
-                    tx_request = Request(f"https://mempool.space/api/tx/{txid}", headers={"User-Agent": "Northstar/1.0"})
-                    with urlopen(tx_request, timeout=20) as response:
-                        transaction = json.loads(response.read())
-                    received = sum(int(output.get("value", 0)) for output in transaction.get("vout", [])
-                                   if output.get("scriptpubkey_address") == BTC_ADDRESS)
-                    if received * price / 100_000_000 < 1.90:
-                        self._json(200, {"verified": False, "error": "This transaction does not show at least $1.90 USD sent to the access address."})
+                    received = bitcoin_transaction_received(txid)
+                    if received * price / 100_000_000 < 1.85:
+                        self._json(200, {"verified": False, "error": "This transaction does not show at least $1.85 USD sent to the access address."})
                         return
                     used.add(txid)
                     REDEEMED_TXIDS.write_text(json.dumps(sorted(used), indent=2) + "\n", encoding="utf-8")
                 self._json(200, {"verified": True})
             except HTTPError as exc:
                 self._json(502 if exc.code >= 500 else 400, {"verified": False, "error": "The Bitcoin explorer could not find or verify that transaction."})
-            except (URLError, TimeoutError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                self._json(502, {"verified": False, "error": f"Could not verify payment right now: {exc}"})
+            except Exception as exc:
+                print(f"Bitcoin verification services failed: {exc}")
+                self._json(502, {"verified": False, "error": "Bitcoin verification services are temporarily unavailable. Please retry shortly."})
             return
 
         if route == "/api/image":
