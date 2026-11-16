@@ -3,6 +3,7 @@
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse, urljoin, parse_qs
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
@@ -585,12 +586,12 @@ def download_and_normalize_image(url, output_path):
     parsed = urlparse(str(url or ""))
     if parsed.scheme != "https" or not parsed.netloc:
         raise RuntimeError("Image provider returned an invalid HTTPS URL.")
-    temporary = Path(output_path).with_suffix(".download")
-    try:
-        curl_download(url, temporary)
-        return save_image_bytes(temporary.read_bytes(), output_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0 Northstar/1.0", "Accept": "image/*"})
+    with urlopen(request, timeout=8) as response:
+        image_data = response.read(15_000_001)
+    if not image_data or len(image_data) > 15_000_000:
+        raise RuntimeError("Image provider returned an empty or oversized image.")
+    return save_image_bytes(image_data, output_path)
 
 
 def ai_horde_image(prompt, output_path, seed=None):
@@ -604,7 +605,7 @@ def ai_horde_image(prompt, output_path, seed=None):
     body = {
         "prompt": prompt,
         "models": ["Deliberate", "ICBINP - I Can't Believe It's Not Photography", "stable_diffusion"],
-        "params": {"width": 512, "height": 512, "steps": 18, "n": 1, "seed": int(seed or random.randint(1, 999999999))},
+        "params": {"width": 512, "height": 512, "steps": 16, "n": 1, "seed": int(seed or random.randint(1, 999999999))},
         "nsfw": True,
         "censor_nsfw": False,
     }
@@ -615,7 +616,7 @@ def ai_horde_image(prompt, output_path, seed=None):
     if not job_id:
         raise RuntimeError("AI Horde did not return a generation ID.")
 
-    deadline = time.monotonic() + 75
+    deadline = time.monotonic() + 38
     while time.monotonic() < deadline:
         remaining = max(1, deadline - time.monotonic())
         request = Request(f"{base}/check/{job_id}", headers=headers)
@@ -646,7 +647,7 @@ def ai_horde_image(prompt, output_path, seed=None):
                     raise RuntimeError("AI Horde returned an unsupported image value.") from url_exc
             return save_image_bytes(image_data, output_path)
         time.sleep(min(2, max(0, deadline - time.monotonic())))
-    raise TimeoutError("AI Horde image generation exceeded 75 seconds.")
+    raise TimeoutError("AI Horde image generation exceeded its 38-second limit.")
 
 
 def describe_image_edit(image_bytes, image_mime, edit_prompt):
@@ -680,7 +681,19 @@ def describe_image_edit(image_bytes, image_mime, edit_prompt):
                 if isinstance(content, list):
                     content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
                 if str(content).strip():
-                    return str(content).strip()
+                    raw = str(content).strip()
+                    try:
+                        match = re.search(r"\{[\s\S]*\}", raw)
+                        details = json.loads(match.group(0)) if match else {}
+                        subject = str(details.get("description", "")).strip()
+                        direction = str(details.get("edit_prompt", "")).strip()
+                        watermark = details.get("watermark_box")
+                        parts = [part for part in (f"Image description: {subject}" if subject else "", f"Requested edit: {direction}" if direction else f"Requested edit: {edit_prompt}", f"Watermark location (normalized coordinates): {watermark}" if watermark else "") if part]
+                        if parts:
+                            return "\n".join(parts)
+                    except Exception:
+                        pass
+                    return raw
             except HTTPError as exc:
                 if exc.code == 429:
                     time.sleep(1)
@@ -741,14 +754,14 @@ def _remember_image_source(url):
 def pollinations_image(prompt, output_path, seed):
     encoded = quote(str(prompt), safe="")
     urls = (
+        f"https://pollinations.ai/{encoded}?width=768&height=768&seed={seed}&model=flux&nologo=true",
         f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&seed={seed}&nologo=true",
-        f"https://pollinations.ai/{encoded}?width=768&height=768&seed={seed}&nologo=true",
     )
     last_error = None
     for url in urls:
         try:
             request = Request(url, headers={"User-Agent": "Mozilla/5.0 Northstar/1.0", "Accept": "image/*"})
-            with urlopen(request, timeout=20) as response:
+            with urlopen(request, timeout=12) as response:
                 data = response.read(15_000_000)
             if not data:
                 raise RuntimeError("Pollinations returned an empty image.")
@@ -759,7 +772,7 @@ def pollinations_image(prompt, output_path, seed):
 
 def pil_remove_watermark(image_bytes, vision_analysis):
     """Best-effort local inpainting for a vision-located watermark rectangle."""
-    from PIL import Image, ImageFilter, ImageDraw
+    from PIL import Image, ImageFilter, ImageDraw, ImageEnhance
     try:
         text = str(vision_analysis or "")
         match = re.search(r"\{[\s\S]*?\}", text)
@@ -797,6 +810,7 @@ def pil_remove_watermark(image_bytes, vision_analysis):
             alpha=round(255*(offset+1)/feather)
             draw.rectangle((offset,offset,box_w-1-offset,box_h-1-offset),outline=alpha)
         image.paste(patch,(x1,y1),mask)
+        image = ImageEnhance.Contrast(image).enhance(1.02)
         output=io.BytesIO();image.save(output,format="PNG")
         return output.getvalue()
     except Exception:
@@ -1317,21 +1331,35 @@ def _ip_location(ip, accept_language="en"):
         cached = IP_LOCATION_CACHE.get(key)
         if cached and cached[0] > now:
             return dict(cached[1])
-    if not key[0] or key[0] in ("127.0.0.1", "::1"):
-        return {"language": key[1]}
+    result = {"city": "Lagos", "country": "Nigeria", "timezone": "Africa/Lagos", "language": key[1] or "en"}
+    if key[0] and key[0] not in ("127.0.0.1", "::1"):
+        try:
+            url = "http://ip-api.com/json/" + quote(key[0], safe="") + "?fields=status,city,country,timezone,lat,lon"
+            request = Request(url, headers={"Accept-Language": key[1] or "en", "User-Agent": "Northstar/1.0"})
+            with urlopen(request, timeout=1.5) as response:
+                data = json.loads(response.read())
+            if data.get("status") == "success":
+                result.update({name: data.get(name) for name in ("city", "country", "timezone", "lat", "lon") if data.get(name) is not None})
+        except Exception:
+            pass
+    with IP_LOCATION_LOCK:
+        IP_LOCATION_CACHE[key] = (now + 900, dict(result))
+    return result
+
+
+def _live_clock_context(location):
+    timezone_name = str((location or {}).get("timezone") or "Africa/Lagos")
     try:
-        url = "http://ip-api.com/json/" + quote(key[0], safe="") + "?fields=status,city,country,timezone,lat,lon"
-        request = Request(url, headers={"Accept-Language": key[1], "User-Agent": "Northstar/1.0"})
-        with urlopen(request, timeout=1.5) as response:
-            data = json.loads(response.read())
-        result = {"language": key[1]}
-        if data.get("status") == "success":
-            result.update({name: data.get(name) for name in ("city", "country", "timezone", "lat", "lon")})
-        with IP_LOCATION_LOCK:
-            IP_LOCATION_CACHE[key] = (now + 900, dict(result))
-        return result
-    except Exception:
-        return {"language": key[1]}
+        local_now = datetime.now(ZoneInfo(timezone_name))
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        timezone_name = "UTC"
+        local_now = datetime.now(ZoneInfo("UTC"))
+    day_name = local_now.strftime("%A")
+    date_str = local_now.strftime("%B %d, %Y")
+    time_str = local_now.strftime("%-I:%M:%S %p")
+    city = str((location or {}).get("city") or "Lagos")
+    country = str((location or {}).get("country") or "Nigeria")
+    return f"[LIVE CLOCK & LOCATION: {day_name}, {date_str}, {time_str} ({timezone_name}), {city}, {country}]"
 
 def _open_meteo_weather(location):
     if not location or location.get("lat") is None or location.get("lon") is None:
@@ -1522,7 +1550,7 @@ def fallback_search_answer(query):
             break
     if lines:
         return "Here is the most relevant information I could verify from live sources:\n" + "\n".join(lines)
-    return "I can’t verify that from live sources right now. If you share a source or a little more detail, I can help assess it."
+    return "No relevant live result came back for that yet. Try adding a location, date, or more specific detail, and I can focus the search."
 
 
 class ThinkTagStreamFilter:
@@ -2150,7 +2178,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             if route == "/api/image" and not str(payload.get("prompt", "")).strip():
                 self._json(400, {"error": "A non-empty prompt is required."})
                 return
-            if route == "/api/edit-image" and (not str(payload.get("edit_prompt", payload.get("prompt", ""))).strip() or not str(payload.get("image", "")).strip()):
+            if route == "/api/edit-image" and (not str(payload.get("edit_prompt", payload.get("prompt", ""))).strip() or not str(payload.get("image") or payload.get("last_image_base64") or payload.get("last_image_url") or "").strip()):
                 self._json(400, {"error": "Add an image and describe the edit you want."})
                 return
             if route == "/api/chat":
@@ -2367,10 +2395,33 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             return
 
         if route == "/api/edit-image":
-            image_value = str(payload.get("image", "")).strip()
-            image_value = re.sub(r"^data:image/[^;,]+;base64,", "", image_value)
+            image_value = str(payload.get("image") or payload.get("last_image_base64") or payload.get("last_image_url") or "").strip()
+            image_bytes = b""
+            if image_value.startswith("/generated/"):
+                relative = Path(image_value.split("?", 1)[0]).name
+                candidate_path = (ROOT / "generated" / relative).resolve()
+                try:
+                    candidate_path.relative_to((ROOT / "generated").resolve())
+                    if candidate_path.is_file() and candidate_path.stat().st_size <= 12_000_000:
+                        image_bytes = candidate_path.read_bytes()
+                except (ValueError, OSError):
+                    image_bytes = b""
+            elif image_value.startswith("https://"):
+                try:
+                    image_request = Request(image_value, headers={"User-Agent": "Mozilla/5.0 Northstar/1.0", "Accept": "image/*"})
+                    with urlopen(image_request, timeout=8) as image_response:
+                        image_bytes = image_response.read(12_000_001)
+                except Exception:
+                    image_bytes = b""
+            else:
+                image_value = re.sub(r"^data:image/[^;,]+;base64,", "", image_value)
+                try:
+                    image_bytes = base64.b64decode(re.sub(r"\s+", "", image_value), validate=True)
+                except Exception:
+                    image_bytes = b""
             try:
-                image_bytes = base64.b64decode(re.sub(r"\s+", "", image_value), validate=True)
+                if not image_bytes:
+                    raise ValueError("Image content is missing.")
                 if not image_bytes or len(image_bytes) > 12_000_000:
                     raise ValueError("Image must be smaller than 12 MB.")
                 from PIL import Image
@@ -2412,10 +2463,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 if output_path is None:
                     description = describe_image_edit(image_bytes, image_mime, edit_prompt)
                     watermark_only = bool(re.search(r"\bremove\s+(?:the\s+)?watermark\b", edit_prompt, re.I)) and not bool(re.search(r"\b(?:change|replace|add|recolor|crop|background|hair|color)\b", edit_prompt, re.I))
-                    if watermark_only:
-                        cleaned = pil_remove_watermark(image_bytes, description)
-                        if cleaned:
-                            output_path, _mime = save_image_bytes(cleaned, output_stem)
+                    cleaned = pil_remove_watermark(image_bytes, description) if watermark_only else b""
                     generation_prompt = (
                         f"Create a faithful edited image based on this request: {edit_prompt}. "
                         "Preserve the original subject, pose, composition, and background wherever possible. "
@@ -2429,7 +2477,10 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                             try:
                                 output_path, _mime = pollinations_image(generation_prompt, output_stem, edit_seed)
                             except Exception:
-                                output_path, _mime = local_image_fallback(generation_prompt, output_stem)
+                                if cleaned:
+                                    output_path, _mime = save_image_bytes(cleaned, output_stem)
+                                else:
+                                    output_path, _mime = save_image_bytes(image_bytes, output_stem)
 
                 extension = ".png" if valid_image_file(output_path) == "image/png" else ".jpg"
                 final_path = output_path.with_suffix(extension)
@@ -2485,7 +2536,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
 
             if not content_type:
                 try:
-                    output_path, content_type = search_image_fallback(prompt, output_stem)
+                    output_path, content_type = search_image_fallback(original_prompt, output_stem)
                 except Exception:
                     pass
 
@@ -2595,17 +2646,22 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 acknowledgement = f"Sorry {greeting_name}, I’ve updated my knowledge and will use your correction in future answers." if greeting_name else "Thanks for the correction. I’ve updated my knowledge and will use it in future answers."
                 emit_assistant_response(acknowledgement)
                 return
-            if is_simple_greeting(user_prompt, ai_name):
-                emit_assistant_response(simple_greeting_reply(user_prompt, ai_name))
-                return
+            visitor_context = _ip_location(self._visitor_ip(), self.headers.get("Accept-Language", "en"))
+            live_clock = _live_clock_context(visitor_context)
             personalization = f'Your assigned name is {json.dumps(ai_name, ensure_ascii=False)}.'
             if user_name:
                 personalization += f' The user\'s preferred name is {json.dumps(user_name, ensure_ascii=False)}; use it naturally and sparingly.'
             if re.fullmatch(rf"(?:(?:hey|hello|hi)\s+)?{re.escape(ai_name)}[\s?!.,]*", user_prompt.strip(), re.IGNORECASE):
                 personalization += " The latest message is the user calling your name; recognize it as addressing you and reply warmly and attentively in one short sentence."
-            visitor_context = _ip_location(self._visitor_ip(), self.headers.get("Accept-Language", "en"))
             locale_context = ("Visitor context from IP geolocation: " + json.dumps({key: visitor_context.get(key) for key in ("city", "country", "timezone", "language") if visitor_context.get(key)}, ensure_ascii=False) + ". Adapt local facts naturally, and answer in the preferred language when clear from the Accept-Language preference.")
-            dated_system_prompt = f"{NORTHSTAR_SYSTEM_PROMPT}\n{personalization}\nCurrent date: {current_date}. Use this date when interpreting words like today, recent, and current. {locale_context}"
+            dated_system_prompt = f"{NORTHSTAR_SYSTEM_PROMPT}\n{personalization}\n{live_clock}\nCurrent date: {current_date}. Use the live local clock above for questions about today, date, day, or time. {locale_context}"
+            if is_simple_greeting(user_prompt, ai_name):
+                emit_assistant_response(simple_greeting_reply(user_prompt, ai_name))
+                return
+            if re.search(r"\b(?:what(?:'s| is)?|tell me)\s+(?:the\s+)?(?:current\s+)?(?:time|date|day)\b|\bwhat(?:'s| is)\s+today\b", user_prompt, re.I):
+                live_answer = re.sub(r"^\[LIVE CLOCK & LOCATION: |\]$", "", live_clock)
+                emit_assistant_response(f"It’s {live_answer}.")
+                return
             if is_admin_request:
                 dated_system_prompt += "\n[ADMIN SYSTEM DIAGNOSTICS]\n" + json.dumps(self._admin_diagnostics(), ensure_ascii=False) + "\nFor this Admin only, answer questions about site health, logs, code, errors, and feature changes thoroughly and accurately. Never expose these diagnostics, internal code, secrets, or operational details to regular users."
             else:
