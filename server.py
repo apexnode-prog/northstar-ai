@@ -38,8 +38,9 @@ OLLAMA_MODELS_LOCK = threading.Lock()
 FAST_STUDY_MODELS = [
     "openrouter/free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
     "google/gemma-3-27b-it:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free",
 ]
 DEEP_REASONING_MODELS = [
     "deepseek/deepseek-r1:free",
@@ -586,7 +587,7 @@ def ai_horde_image(prompt, output_path):
     body = {
         "prompt": prompt,
         "models": ["Deliberate", "ICBINP - I Can't Believe It's Not Photography", "stable_diffusion"],
-        "params": {"width": 512, "height": 512, "steps": 16, "n": 1},
+        "params": {"width": 512, "height": 512, "steps": 18, "n": 1},
         "nsfw": True,
         "censor_nsfw": False,
     }
@@ -629,6 +630,72 @@ def ai_horde_image(prompt, output_path):
             return save_image_bytes(image_data, output_path)
         time.sleep(min(2, max(0, deadline - time.monotonic())))
     raise TimeoutError("AI Horde image generation exceeded 75 seconds.")
+
+
+def describe_image_edit(image_bytes, image_mime, edit_prompt):
+    """Describe the upload and convert the user's requested change into an image prompt."""
+    image_data_url = f"data:{image_mime};base64," + base64.b64encode(image_bytes).decode("ascii")
+    instruction = (
+        "Inspect the supplied image accurately and follow the edit instruction exactly. "
+        "Return a compact visual description and a detailed image-generation prompt that applies only the requested changes. "
+        "Preserve subject identity, pose, framing, clothing, lighting, and background unless the user requests a change. "
+        "Do not invent additional changes.\nEdit instruction: " + str(edit_prompt)
+    )
+    if OPENROUTER_API_KEY:
+        for model_name in ("openrouter/free", "google/gemma-3-27b-it:free"):
+            request = Request(
+                "https://openrouter.ai/api/v1/chat/completions",
+                data=json.dumps({
+                    "model": model_name,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": instruction},
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                    ]}],
+                }).encode("utf-8"),
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=15) as response:
+                    result = json.loads(response.read())
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+                if str(content).strip():
+                    return str(content).strip()
+            except HTTPError as exc:
+                if exc.code == 429:
+                    time.sleep(1)
+            except Exception:
+                continue
+    try:
+        with urlopen("http://127.0.0.1:11434/api/tags", timeout=4) as response:
+            installed = json.loads(response.read()).get("models", [])
+        model_name = next(
+            (str(model.get("name", "")) for model in installed
+             if any(tag in str(model.get("name", "")).lower()
+                    for tag in ("llava", "moondream", "minicpm-v", "llama3.2-vision"))),
+            None,
+        )
+        if model_name:
+            local_request = Request(
+                OLLAMA_URL,
+                data=json.dumps({
+                    "model": model_name,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": instruction,
+                                  "images": [base64.b64encode(image_bytes).decode("ascii")]}],
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(local_request, timeout=25) as response:
+                result = json.loads(response.read())
+            return str(result.get("message", {}).get("content", "")).strip()
+    except Exception:
+        pass
+    return ""
 
 
 def search_image_fallback(prompt, output_path):
@@ -1076,15 +1143,43 @@ def needs_live_search(query):
 
 
 SIMPLE_GREETING_RE = re.compile(
-    r"^(?:hi|hello|hey|hiya|howdy|good\s+(?:morning|afternoon|evening)|"
+    r"^(?:hi(?:\s+(?:there|dear|friend))?|hello(?:\s+(?:there|dear|friend))?|"
+    r"hey(?:\s+(?:there|dear|friend))?|hiya|howdy|yo|sup|"
+    r"good\s+(?:morning|afternoon|evening)|"
     r"how\s+are\s+you(?:\s+doing)?|how's\s+it\s+going|what's\s+up|whats\s+up|"
-    r"how\s+have\s+you\s+been)\s*[!.?]*$",
+    r"how\s+have\s+you\s+been|you\s+good|how\s+are\s+things(?:\s+going)?|"
+    r"how(?:\s+is|\s*\'s)\s+your\s+day|what\s+are\s+you\s+up\s+to)\s*[!.?]*$",
     re.IGNORECASE,
 )
 
 
-def is_simple_greeting(query):
-    return bool(SIMPLE_GREETING_RE.fullmatch(re.sub(r"\s+", " ", str(query or "").strip())))
+def is_simple_greeting(query, ai_name=None):
+    normalized = re.sub(r"\s+", " ", str(query or "").strip())
+    if SIMPLE_GREETING_RE.fullmatch(normalized):
+        return True
+    name = str(ai_name or "").strip()
+    if name:
+        return bool(re.fullmatch(
+            rf"(?:(?:hey|hello|hi)\s+)?{re.escape(name)}[\s?!.,]*",
+            normalized,
+            re.IGNORECASE,
+        ))
+    return False
+
+
+def simple_greeting_reply(query, ai_name="Northstar"):
+    normalized = re.sub(r"\s+", " ", str(query or "").strip()).lower()
+    if re.match(r"how\s+are\s+you", normalized):
+        return "I’m doing well, thanks for asking. How are you?"
+    if re.match(r"good\s+morning", normalized):
+        return "Good morning! What can I help you with?"
+    if re.match(r"good\s+afternoon", normalized):
+        return "Good afternoon! What can I help you with?"
+    if re.match(r"good\s+evening", normalized):
+        return "Good evening! What can I help you with?"
+    if ai_name and re.fullmatch(rf"(?:(?:hey|hello|hi)\s+)?{re.escape(ai_name)}[\s?!.,]*", str(query or "").strip(), re.IGNORECASE):
+        return "I’m here. What can I help you with?"
+    return "Hey! How can I help you today?"
 
 
 FACTUAL_OR_RESEARCH_RE = re.compile(
@@ -1108,30 +1203,8 @@ def should_search_web(query, enabled=True):
 
 
 def fallback_search_answer(query):
-    """Create a readable, source-backed answer when every language model is unavailable."""
-    try:
-        research = web_search(str(query or "")[:12000])
-        items = list(research.get("results", []))
-        pages = list(research.get("pages", []))
-        lines = []
-        for page in pages[:3]:
-            title = str(page.get("title") or page.get("url") or "Source")[:180]
-            excerpt = re.sub(r"\s+", " ", str(page.get("text") or "")).strip()[:900]
-            if excerpt:
-                lines.append(f"- **{title}:** {excerpt} ({page.get('url', '')})")
-        for item in items[:5]:
-            title = re.sub(r"\s+", " ", str(item.get("title") or "Search result")).strip()[:180]
-            snippet = re.sub(r"\s+", " ", str(item.get("snippet") or "")).strip()[:700]
-            if snippet:
-                lines.append(f"- **{title}:** {snippet} ({item.get('url', '')})")
-        if lines:
-            return "I can’t reach the AI model right now, but here’s a quick summary from the available search sources:\n\n" + "\n".join(lines[:5])
-    except Exception:
-        pass
-    return (
-        "I’m temporarily unable to reach the AI service or retrieve reliable search results. "
-        "Please try again in a moment, or narrow the question to one part and I’ll help with that first."
-    )
+    """Never substitute unrelated search snippets for a model answer."""
+    return "I couldn’t reach a reply model just now. Please try again in a moment."
 
 
 class ThinkTagStreamFilter:
@@ -1336,6 +1409,54 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self._json(502, {"error": f"Could not query Ollama models: {exc}"})
             return
         super().do_GET()
+
+    def _try_local_chat_fallback(self, messages, emit_assistant_response):
+        """Use a locally installed Ollama model when all OpenRouter models fail."""
+        try:
+            available = self._ollama_models()
+            if not available:
+                return False
+            has_images = any(message.get("images") for message in messages if isinstance(message, dict))
+            names = [str(model.get("name", "")) for model in available]
+            if has_images:
+                vision = next((name for name in names
+                               if any(tag in name.lower() for tag in ("llava", "moondream", "minicpm-v", "llama3.2-vision"))), None)
+                if not vision:
+                    return False
+                model_name = vision
+            else:
+                model_name = names[0]
+            local_messages = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        str(part.get("text", "")) for part in content if isinstance(part, dict)
+                    )
+                local_message = {"role": message.get("role", "user"), "content": str(content or "")}
+                if message.get("images"):
+                    local_message["images"] = message["images"]
+                local_messages.append(local_message)
+            body = json.dumps({
+                "model": model_name,
+                "messages": local_messages,
+                "stream": False,
+                "keep_alive": "24h",
+                "options": {"num_ctx": 8192, "num_predict": 2048, "temperature": 0.7},
+            }).encode("utf-8")
+            request = Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"}, method="POST")
+            with urlopen(request, timeout=22) as response:
+                result = json.loads(response.read())
+            answer = str(result.get("message", {}).get("content", result.get("response", ""))).strip()
+            if not answer:
+                return False
+            emit_assistant_response(answer)
+            return True
+        except Exception as exc:
+            print(f"Local Ollama fallback unavailable: {exc}")
+            return False
 
     def do_POST(self):
         self._northstar_response_started = False
@@ -1652,8 +1773,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                             try:
                                 result_image = client.image_to_image(image_bytes, prompt=edit_prompt, model=model_id)
                                 break
-                            except Exception as exc:
-                                print(f"HF image edit model {model_id} unavailable: {exc}")
+                            except Exception:
+                                pass
                         if result_image is not None:
                             if isinstance(result_image, (bytes, bytearray)):
                                 result_bytes = bytes(result_image)
@@ -1662,42 +1783,11 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                                 result_image.save(result_buffer, format="PNG")
                                 result_bytes = result_buffer.getvalue()
                             output_path, _mime = save_image_bytes(result_bytes, output_stem)
-                    except Exception as exc:
-                        print(f"Hugging Face image editing unavailable: {exc}")
+                    except Exception:
+                        pass
 
                 if output_path is None:
-                    description = ""
-                    if OPENROUTER_API_KEY:
-                        image_data_url = f"data:{image_mime};base64," + base64.b64encode(image_bytes).decode("ascii")
-                        for vision_model in ("google/gemini-2.0-flash-exp:free", "openrouter/free"):
-                            try:
-                                vision_request = Request(
-                                    "https://openrouter.ai/api/v1/chat/completions",
-                                    data=json.dumps({
-                                        "model": vision_model,
-                                        "stream": False,
-                                        "messages": [{"role": "user", "content": [
-                                            {"type": "text", "text": (
-                                                "Describe the visible image accurately, then turn the requested edit into a concise image-generation prompt. "
-                                                "Preserve the same subject identity, pose, framing, and background unless the requested edit changes them. "
-                                                f"Requested edit: {edit_prompt}"
-                                            )},
-                                            {"type": "image_url", "image_url": {"url": image_data_url}},
-                                        ]}],
-                                    }).encode("utf-8"),
-                                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-                                    method="POST",
-                                )
-                                with urlopen(vision_request, timeout=30) as response:
-                                    vision_result = json.loads(response.read())
-                                content = vision_result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                                if isinstance(content, list):
-                                    content = " ".join(part.get("text", "") for part in content if isinstance(part, dict))
-                                description = str(content).strip()
-                                if description:
-                                    break
-                            except Exception as exc:
-                                print(f"OpenRouter image description model {vision_model} unavailable: {exc}")
+                    description = describe_image_edit(image_bytes, image_mime, edit_prompt)
                     generation_prompt = (
                         f"Create a faithful edited image based on this request: {edit_prompt}. "
                         "Preserve the original subject, pose, composition, and background wherever possible. "
@@ -1705,8 +1795,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     )
                     try:
                         output_path, _mime = ai_horde_image(generation_prompt, output_stem)
-                    except Exception as exc:
-                        print(f"AI Horde image edit fallback unavailable: {exc}")
+                    except Exception:
                         output_path, _mime = local_image_fallback(generation_prompt, output_stem)
 
                 extension = ".png" if valid_image_file(output_path) == "image/png" else ".jpg"
@@ -1767,29 +1856,6 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     output_stem.with_suffix(image_suffix).unlink(missing_ok=True)
                 try:
                     output_path, content_type = ai_horde_image(prompt, output_path)
-                except Exception:
-                    pass
-
-            if not content_type:
-                try:
-                    output_path, content_type = search_image_fallback(prompt, output_path)
-                except Exception:
-                    pass
-
-            if not content_type:
-                try:
-                    output_path, content_type = lexica_image(prompt, output_path)
-                except Exception:
-                    pass
-
-            if not content_type:
-                try:
-                    encoded_prompt = quote(prompt, safe="")
-                    pollinations_url = (
-                        f"https://pollinations.ai/{encoded_prompt}?width=1024&height=1024"
-                        f"&model=flux&nologo=true&seed={random.randrange(1, 2**31)}"
-                    )
-                    output_path, content_type = download_and_normalize_image(pollinations_url, output_path)
                 except Exception:
                     pass
 
@@ -1874,6 +1940,9 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             current_date = datetime.now().strftime("%B %d, %Y")
             ai_name = re.sub(r"[\r\n\x00-\x1f]", " ", str(payload.get("ai_name") or "Northstar")).strip()[:60] or "Northstar"
             user_name = re.sub(r"[\r\n\x00-\x1f]", " ", str(payload.get("user_name") or "")).strip()[:60]
+            if is_simple_greeting(user_prompt, ai_name):
+                emit_assistant_response(simple_greeting_reply(user_prompt, ai_name))
+                return
             personalization = f'Your assigned name is {json.dumps(ai_name, ensure_ascii=False)}.'
             if user_name:
                 personalization += f' The user\'s preferred name is {json.dumps(user_name, ensure_ascii=False)}; use it naturally and sparingly.'
@@ -2009,13 +2078,17 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     except HTTPError as exc:
                         last_retryable_error = exc
                         if exc.code in (400, 404, 429, 500, 502, 503):
+                            if exc.code == 429 and model_name != models[-1]:
+                                time.sleep(1)
                             continue
                         break
                     except (URLError, TimeoutError, socket.timeout, OSError) as exc:
                         last_retryable_error = exc
                         continue
                 if upstream is None:
-                    print(f"All OpenRouter models failed; returning search fallback: {last_retryable_error}")
+                    print(f"All OpenRouter models failed; trying local Ollama: {last_retryable_error}")
+                    if self._try_local_chat_fallback(messages, emit_assistant_response):
+                        return
                     emit_assistant_response(fallback_search_answer(user_prompt))
                     return
 
@@ -2062,8 +2135,9 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(b'{"message":{"content":""},"done":true}\n')
                     self.wfile.flush()
                 except (HTTPError, URLError, TimeoutError, socket.timeout, OSError) as exc:
-                    print(f"OpenRouter stream ended; returning search fallback: {exc}")
-                    emit_assistant_response(fallback_search_answer(user_prompt))
+                    print(f"OpenRouter stream ended; trying local fallback: {exc}")
+                    if not self._try_local_chat_fallback(messages, emit_assistant_response):
+                        emit_assistant_response(fallback_search_answer(user_prompt))
                 finally:
                     upstream.close()
                 return
