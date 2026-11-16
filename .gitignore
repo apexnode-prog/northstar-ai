@@ -6,3 +6,8 @@ generated/
 redeemed_txids.json
 ngrok
 ip_usage.json
+.env
+verified_students.json
+verified_users.json
+
+email_usage.json
