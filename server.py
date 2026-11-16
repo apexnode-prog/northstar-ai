@@ -34,6 +34,7 @@ import smtplib
 import ssl
 import secrets
 import time
+import traceback
 from email.message import EmailMessage
 
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -55,6 +56,15 @@ DEEP_REASONING_MODELS = [
     "openrouter/free",
 ]
 ROOT = Path(__file__).resolve().parent
+SERVER_STARTED_AT = time.time()
+ERROR_LOG = []
+ERROR_LOG_LOCK = threading.Lock()
+ERROR_SIGNATURES = {}
+ERROR_DEDUP_SECONDS = 600
+FRONTEND_ERROR_RATES = {}
+FRONTEND_ERROR_RATE_LOCK = threading.Lock()
+STUDY_STATS_PATH = ROOT / "leaderboard_stats.json"
+STUDY_STATS_LOCK = threading.Lock()
 BTC_ADDRESS = "bc1qss003pkz4gyzsp7y7r0gx7t6f20wq8ngjev99qaqvpfzl2ee088qgcups5"
 ADMIN_EMAIL = "ayormarf@icloud.com"
 ADMIN_OTP_LOCK = threading.Lock()
@@ -125,6 +135,92 @@ SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "https://qgnkivlzscvxxoancafp.
 if SUPABASE_URL.endswith("/rest/v1"):
     SUPABASE_URL = SUPABASE_URL[:-8].rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+
+
+def _send_error_alert(entry):
+    if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
+        return
+    try:
+        message = EmailMessage()
+        message["Subject"] = f"Northstar system error: {entry['source']}"
+        message["From"] = SMTP_EMAIL
+        message["To"] = ADMIN_EMAIL
+        message.set_content(
+            f"Source: {entry['source']}\nTimestamp: {entry['timestamp']}\n"
+            f"Signature: {entry['signature']}\n\nDetails:\n{entry['details']}"
+        )
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=12, context=ssl.create_default_context()) as smtp:
+            smtp.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
+            smtp.send_message(message)
+    except Exception as exc:
+        print(f"System error alert delivery failed: {exc}")
+
+
+def _record_system_error(source, message, details=None):
+    """Record and alert once per normalized error signature every ten minutes."""
+    source = re.sub(r"[^A-Za-z0-9_./ -]", "", str(source or "unknown"))[:100] or "unknown"
+    message = re.sub(r"\s+", " ", str(message or "Unknown error")).strip()[:1200]
+    active_traceback = traceback.format_exc()
+    if active_traceback.strip() == "NoneType: None":
+        active_traceback = ""
+    details = (str(details or active_traceback or message))[:12000]
+    signature = hashlib.sha256(f"{source}|{message}".lower().encode("utf-8", "replace")).hexdigest()[:20]
+    now = time.time()
+    with ERROR_LOG_LOCK:
+        for key, expires in list(ERROR_SIGNATURES.items()):
+            if expires <= now:
+                ERROR_SIGNATURES.pop(key, None)
+        if signature in ERROR_SIGNATURES:
+            return False
+        entry = {"source": source, "message": message, "details": details,
+                 "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                 "signature": signature}
+        ERROR_SIGNATURES[signature] = now + ERROR_DEDUP_SECONDS
+        ERROR_LOG.append(entry)
+        del ERROR_LOG[:-500]
+    threading.Thread(target=_send_error_alert, args=(entry,), daemon=True, name="northstar-error-alert").start()
+    return True
+
+
+def _load_study_stats():
+    try:
+        data = json.loads(STUDY_STATS_PATH.read_text("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_study_stats(data):
+    temporary = STUDY_STATS_PATH.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(STUDY_STATS_PATH)
+
+
+def _leaderboard_snapshot():
+    stats = _load_study_stats()
+    rows_by_id = {}
+    if SUPABASE_KEY:
+        try:
+            users = _supabase_request("GET", "northstar_users?select=email,messages_used&limit=5000", timeout=2.0) or []
+        except Exception:
+            users = []
+    else:
+        users = [{"email": email, "messages_used": count} for email, count in load_email_usage().items()]
+    for user in users:
+        email = normalize_email(user.get("email", "")) if isinstance(user, dict) else ""
+        if not email:
+            continue
+        key = hashlib.sha256(email.encode("utf-8")).hexdigest()
+        local = stats.get(key, {}) if isinstance(stats.get(key), dict) else {}
+        messages = max(int(user.get("messages_used", 0) or 0), int(local.get("messages_sent", 0) or 0))
+        row = {"visits": int(local.get("visits", 0) or 0), "messages_sent": messages,
+               "timer_minutes": int(local.get("timer_minutes", 0) or 0),
+               "quizzes_completed": int(local.get("quizzes_completed", 0) or 0),
+               "flashcards_completed": int(local.get("flashcards_completed", 0) or 0),
+               "daily_streak": int(local.get("daily_streak", 0) or 0)}
+        score = messages + 2 * row["timer_minutes"] + 5 * row["quizzes_completed"] + 2 * row["flashcards_completed"] + 3 * row["daily_streak"]
+        rows_by_id[key] = {"name": f"Learner {key[:5].upper()}", "score": score, **row}
+    return sorted(rows_by_id.values(), key=lambda item: (item["score"], item["messages_sent"]), reverse=True)[:25]
 
 
 def _supabase_request(method, path, body=None, prefer=None, timeout=12):
@@ -604,7 +700,7 @@ def ai_horde_image(prompt, output_path, seed=None):
     }
     body = {
         "prompt": prompt,
-        "models": ["Deliberate", "ICBINP - I Can't Believe It's Not Photography", "stable_diffusion"],
+        "models": ["Deliberate", "stable_diffusion"],
         "params": {"width": 512, "height": 512, "steps": 16, "n": 1, "seed": int(seed or random.randint(1, 999999999))},
         "nsfw": True,
         "censor_nsfw": False,
@@ -695,9 +791,11 @@ def describe_image_edit(image_bytes, image_mime, edit_prompt):
                         pass
                     return raw
             except HTTPError as exc:
+                _record_system_error(f"Image edit vision {model_name}", exc)
                 if exc.code == 429:
                     time.sleep(1)
-            except Exception:
+            except Exception as exc:
+                _record_system_error(f"Image edit vision {model_name}", exc)
                 continue
     try:
         with urlopen("http://127.0.0.1:11434/api/tags", timeout=4) as response:
@@ -761,7 +859,7 @@ def pollinations_image(prompt, output_path, seed):
     for url in urls:
         try:
             request = Request(url, headers={"User-Agent": "Mozilla/5.0 Northstar/1.0", "Accept": "image/*"})
-            with urlopen(request, timeout=12) as response:
+            with urlopen(request, timeout=10) as response:
                 data = response.read(15_000_000)
             if not data:
                 raise RuntimeError("Pollinations returned an empty image.")
@@ -1656,10 +1754,8 @@ class _HTMLBalanceChecker(HTMLParser):
             if current not in self.OPTIONAL_CLOSE:
                 self.errors.append(f"Unclosed tag before </{tag}>: {current}")
 
-def _validate_server_sources():
-    server_source = (ROOT / "server.py").read_text("utf-8")
+def _validate_source_texts(server_source, html_source, working_dir=None):
     ast.parse(server_source, filename="server.py")
-    html_source = (ROOT / "index.html").read_text("utf-8")
     parser = _HTMLBalanceChecker()
     parser.feed(html_source)
     parser.close()
@@ -1675,11 +1771,15 @@ def _validate_server_sources():
         script_file.write("\n".join(inline_scripts))
         script_path = Path(script_file.name)
     try:
-        result = subprocess.run([node, "--check", str(script_path)], capture_output=True, text=True, timeout=8)
+        result = subprocess.run([node, "--check", str(script_path)], cwd=working_dir, capture_output=True, text=True, timeout=8)
         if result.returncode:
             raise RuntimeError("JavaScript syntax check failed.")
     finally:
         script_path.unlink(missing_ok=True)
+
+
+def _validate_server_sources():
+    return _validate_source_texts((ROOT / "server.py").read_text("utf-8"), (ROOT / "index.html").read_text("utf-8"), ROOT)
 
 class NorthstarHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -1702,9 +1802,11 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         try:
             if self.path.startswith("/api/"):
                 try: self._track_device()
-                except Exception: pass
+                except Exception as exc: _record_system_error("GET device tracking", exc)
             self._do_GET()
         except Exception as exc:
+            if self.path.startswith("/api/"):
+                _record_system_error(f"GET {self.path.split('?', 1)[0]}", exc)
             print(f"Unhandled GET route error for {self.path}: {exc}")
             if not self._northstar_response_started and self.path.startswith("/api/"):
                 self._json(500, {"error": "The request could not be completed. Please retry shortly."})
@@ -1823,11 +1925,18 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
 
     def _handle_get(self):
         route = self.path.split("?", 1)[0]
-        if route == "/api/admin/telemetry":
+        if route in ("/api/admin/telemetry", "/api/admin/diagnostics"):
             if not self._is_admin_session():
                 self._json(403, {"error": "Admin authentication is required."})
                 return
             self._json(200, self._admin_diagnostics())
+            return
+        if route == "/api/leaderboard":
+            try:
+                self._json(200, {"leaderboard": _leaderboard_snapshot()})
+            except Exception as exc:
+                _record_system_error("GET /api/leaderboard", exc)
+                self._json(200, {"leaderboard": [], "error": "Leaderboard is temporarily unavailable."})
             return
         if route == "/api/trial-status":
             try:
@@ -1835,6 +1944,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 snapshot["unlocked"] = self._has_access_token() or bool(self._paid_email())
                 self._json(200, snapshot)
             except Exception as exc:
+                _record_system_error("GET /api/trial-status", exc)
                 print(f"Trial status lookup failed: {exc}")
                 self._json(503, {"error": "Account service is temporarily unavailable."})
             return
@@ -1842,6 +1952,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             try:
                 self._json(200, {"models": self._ollama_models()})
             except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                _record_system_error("GET /api/tags", exc)
                 self._json(502, {"error": f"Could not query Ollama models: {exc}"})
             return
         super().do_GET()
@@ -1901,7 +2012,12 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         online_users = len({item.get("email") for item in devices if item.get("role") == "user" and item.get("email")})
         for item in devices:
             item.pop("last_seen_epoch", None)
-        return {"recent_logs": logs or ["No server.log file is present; runtime output is managed by the process supervisor."],
+        with ERROR_LOG_LOCK:
+            errors = [dict(item) for item in reversed(ERROR_LOG)]
+            error_count = len(ERROR_LOG)
+        return {"error_count": error_count, "errors": errors,
+                "uptime_seconds": max(0, int(time.time() - SERVER_STARTED_AT)),
+                "recent_logs": logs or ["No server.log file is present; runtime output is managed by the process supervisor."],
                 "live_stats": {"online_users": online_users, "active_devices": devices, "active_device_count": len(devices)},
                 "service_status": {"openrouter": openrouter_status, "supabase": supabase_status, "huggingface_token_configured": bool(HF_TOKEN)},
                 "account_payment_stats": {"verified_users_local": user_count, "redeemed_txids_local": payment_count,
@@ -1937,7 +2053,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     response_data = json.loads(response.read())
                 result = response_data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 if result: break
-            except Exception:
+            except Exception as exc:
+                _record_system_error("POST /api/admin/self-edit OpenRouter", exc)
                 continue
         try:
             payload_out = json.loads(str(result or ""))
@@ -1965,14 +2082,26 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         if check.returncode:
             self._json(422, {"applied": False, "error": "Patch validation failed against the current source."})
             return
+        try:
+            with tempfile.TemporaryDirectory(prefix="northstar-self-edit-") as staged_dir:
+                staged_root = Path(staged_dir)
+                for name, content in sources.items():
+                    (staged_root / name).write_text(content, encoding="utf-8")
+                staged_apply = subprocess.run(["git", "apply", "--whitespace=error"], cwd=staged_root, input=patch, text=True, capture_output=True, timeout=8)
+                if staged_apply.returncode:
+                    raise RuntimeError("Patch could not be staged safely.")
+                _validate_source_texts((staged_root / "server.py").read_text("utf-8"), (staged_root / "index.html").read_text("utf-8"), staged_root)
+        except Exception as exc:
+            _record_system_error("POST /api/admin/self-edit validation", exc)
+            self._json(422, {"applied": False, "error": "The proposed patch failed pre-write validation."})
+            return
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         backups = {}
         try:
             for name, content in sources.items():
-                if any(a == name for a, _ in headers):
-                    backup = ROOT / f"{name}.{stamp}.bak"
-                    backup.write_text(content, encoding="utf-8")
-                    backups[name] = backup
+                backup = ROOT / f"{name}.{stamp}.bak"
+                backup.write_text(content, encoding="utf-8")
+                backups[name] = backup
             apply = subprocess.run(["git", "apply", "--whitespace=error"], cwd=ROOT, input=patch, text=True, capture_output=True, timeout=8)
             if apply.returncode:
                 raise RuntimeError("Could not apply the validated patch.")
@@ -2030,6 +2159,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             emit_assistant_response(answer)
             return True
         except Exception as exc:
+            _record_system_error("POST /api/chat local Ollama fallback", exc)
             print(f"Local Ollama fallback unavailable: {exc}")
             return False
 
@@ -2041,6 +2171,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         except Exception as exc:
+            if self.path.startswith("/api/"):
+                _record_system_error(f"POST {self.path.split('?', 1)[0]}", exc)
             print(f"Unhandled POST route error for {self.path}: {exc}")
             if self._northstar_streaming and self._northstar_response_started:
                 try:
@@ -2076,7 +2208,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             return
         if route.startswith("/api/"):
             try: self._track_device()
-            except Exception: pass
+            except Exception as exc: _record_system_error(f"{route} device tracking", exc)
 
         if route == "/api/admin/send-code":
             if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
@@ -2105,6 +2237,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     smtp.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
                     smtp.send_message(message)
             except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+                _record_system_error("POST /api/admin/send-code", exc)
                 print(f"Admin OTP email delivery failed: {exc}")
                 self._json(502, {"sent": False, "error": "Could not send the Admin code. Check the mail service and retry."})
                 return
@@ -2134,6 +2267,58 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             self._json(200, {"verified": True, "role": "admin", "token": token, "expires_in": ADMIN_SESSION_TTL})
             return
 
+        if route == "/api/report-error":
+            now = time.time()
+            ip = self._visitor_ip()
+            with FRONTEND_ERROR_RATE_LOCK:
+                recent = [stamp for stamp in FRONTEND_ERROR_RATES.get(ip, []) if now - stamp < 300]
+                if len(recent) >= 8:
+                    self._json(429, {"received": False, "error": "Too many browser error reports. Try again later."})
+                    return
+                recent.append(now)
+                FRONTEND_ERROR_RATES[ip] = recent
+            source = str(payload.get("source", "browser"))[:100]
+            message = str(payload.get("message", "Frontend error"))[:1200]
+            details = str(payload.get("details", ""))[:8000]
+            _record_system_error(f"frontend:{source}", message, details)
+            self._json(202, {"received": True})
+            return
+
+        if route == "/api/leaderboard":
+            try:
+                email = self._verified_email()
+                if not email:
+                    self._json(401, {"error": "Sign in with a verified email to save study statistics."})
+                    return
+                raw_stats = payload.get("stats", {})
+                if not isinstance(raw_stats, dict):
+                    self._json(400, {"error": "Stats must be an object."})
+                    return
+                fields = ("visits", "messages_sent", "timer_minutes", "quizzes_completed", "flashcards_completed", "daily_streak")
+                values = {field: min(1_000_000, max(0, int(raw_stats.get(field, 0) or 0))) for field in fields}
+                key = hashlib.sha256(email.encode("utf-8")).hexdigest()
+                with STUDY_STATS_LOCK:
+                    stats = _load_study_stats()
+                    stats[key] = {**values, "updated_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+                    _save_study_stats(stats)
+                self._json(200, {"saved": True, "leaderboard": _leaderboard_snapshot()})
+            except (TypeError, ValueError) as exc:
+                self._json(400, {"error": "Study statistics contain an invalid number."})
+            except Exception as exc:
+                _record_system_error("POST /api/leaderboard", exc)
+                self._json(503, {"error": "Study statistics could not be saved."})
+            return
+
+        if route == "/api/admin/clear-errors":
+            if not self._is_admin_session():
+                self._json(403, {"error": "Admin authentication is required."})
+                return
+            with ERROR_LOG_LOCK:
+                ERROR_LOG.clear()
+                ERROR_SIGNATURES.clear()
+            self._json(200, {"cleared": True, "error_count": 0})
+            return
+
         if route == "/api/admin/session":
             if not self._is_admin_session():
                 self._json(401, {"verified": False, "error": "Admin session expired."})
@@ -2141,7 +2326,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             self._json(200, {"verified": True, "role": "admin"})
             return
 
-        if route == "/api/admin/telemetry":
+        if route in ("/api/admin/telemetry", "/api/admin/diagnostics"):
             if not self._is_admin_session():
                 self._json(403, {"error": "Admin authentication is required."})
                 return
@@ -2160,6 +2345,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             try:
                 already_unlocked = self._has_access_token() or bool(self._paid_email())
             except Exception as exc:
+                _record_system_error(f"{route} account access", exc)
                 print(f"Account access lookup failed: {exc}")
                 self._json(503, {"error": "Account service is temporarily unavailable. Please retry shortly."})
                 return
@@ -2169,6 +2355,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 try:
                     verified_email = self._verified_email()
                 except Exception as exc:
+                    _record_system_error(f"{route} email verification", exc)
                     print(f"Account verification lookup failed: {exc}")
                     self._json(503, {"error": "Account service is temporarily unavailable. Please retry shortly."})
                     return
@@ -2195,6 +2382,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             try:
                 kind, trial_key = self._trial_key()
             except Exception as exc:
+                _record_system_error(f"{route} trial lookup", exc)
                 print(f"Account lookup failed: {exc}")
                 self._json(503, {"error": "Account service is temporarily unavailable. Please retry shortly."})
                 return
@@ -2208,6 +2396,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                             return
                         upsert_user_record(trial_key, {"verified": True, "messages_used": used + 1})
                 except Exception as exc:
+                    _record_system_error(f"{route} usage update", exc)
                     print(f"Account usage update failed: {exc}")
                     self._json(503, {"error": "Could not update your account usage. Please retry shortly."})
                     return
@@ -2251,6 +2440,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     smtp.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
                     smtp.send_message(message)
             except (smtplib.SMTPException, OSError, TimeoutError) as exc:
+                _record_system_error("POST /api/auth/send-code", exc)
                 print(f"Student verification email could not be sent: {exc}")
                 self._json(502, {"error": "Could not send the verification email. Check the Gmail SMTP settings and try again."})
                 return
@@ -2267,6 +2457,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             try:
                 record = get_user_record(email)
             except Exception as exc:
+                _record_system_error("POST /api/auth/login-email", exc)
                 print(f"Email login lookup failed: {exc}")
                 self._json(503, {"found": False, "error": "Account service is temporarily unavailable. Please retry shortly."})
                 return
@@ -2308,6 +2499,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                         save_email_usage(usage)
                 record = get_user_record(email) or {"messages_used": 0, "paid": False}
             except Exception as exc:
+                _record_system_error("POST /api/auth/verify-code", exc)
                 print(f"Verified account persistence failed: {exc}")
                 self._json(503, {"verified": False, "error": "Could not save your account right now. Please retry shortly."})
                 return
@@ -2384,11 +2576,13 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 upsert_user_record(email, {"verified": True, "paid": True, "txid": txid}, timeout=1.5)
                 self._json(200, {"verified": True, "paid": True, "email": email})
             except HTTPError as exc:
+                _record_system_error("POST /api/verify-btc", exc)
                 if SUPABASE_KEY and str(getattr(exc, "url", "")).startswith(SUPABASE_URL):
                     self._json(503, {"verified": False, "error": "Account service is temporarily unavailable. Please retry shortly."})
                 else:
                     self._json(502 if exc.code >= 500 else 400, {"verified": False, "error": "The Bitcoin explorer could not find or verify that transaction."})
             except Exception as exc:
+                _record_system_error("POST /api/verify-btc", exc)
                 print(f"Bitcoin verification services failed: {exc}")
                 message = "Account service is temporarily unavailable. Please retry shortly." if SUPABASE_KEY and ("Supabase" in str(exc) or isinstance(exc, HTTPError)) else "Bitcoin verification is taking longer than expected. Please retry shortly."
                 self._json(503, {"verified": False, "error": message})
@@ -2447,8 +2641,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                             try:
                                 result_image = client.image_to_image(image_bytes, prompt=edit_prompt, model=model_id)
                                 break
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                _record_system_error(f"POST /api/edit-image {model_id}", exc)
                         if result_image is not None:
                             if isinstance(result_image, (bytes, bytearray)):
                                 result_bytes = bytes(result_image)
@@ -2457,8 +2651,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                                 result_image.save(result_buffer, format="PNG")
                                 result_bytes = result_buffer.getvalue()
                             output_path, _mime = save_image_bytes(result_bytes, output_stem)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _record_system_error("POST /api/edit-image Hugging Face", exc)
 
                 if output_path is None:
                     description = describe_image_edit(image_bytes, image_mime, edit_prompt)
@@ -2473,10 +2667,12 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     if output_path is None:
                         try:
                             output_path, _mime = ai_horde_image(generation_prompt, output_stem, edit_seed)
-                        except Exception:
+                        except Exception as exc:
+                            _record_system_error("POST /api/edit-image AI Horde", exc)
                             try:
                                 output_path, _mime = pollinations_image(generation_prompt, output_stem, edit_seed)
-                            except Exception:
+                            except Exception as pollinations_error:
+                                _record_system_error("POST /api/edit-image Pollinations", pollinations_error)
                                 if cleaned:
                                     output_path, _mime = save_image_bytes(cleaned, output_stem)
                                 else:
@@ -2488,6 +2684,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     output_path.replace(final_path)
                 self._json(200, {"url": f"/generated/{final_path.name}", "message": "Here is the edited image."})
             except Exception as exc:
+                _record_system_error("POST /api/edit-image", exc)
                 print(f"Image editing failed: {exc}")
                 self._json(502, {"error": "The image edit could not be completed right now. Try again shortly."})
             return
@@ -2511,7 +2708,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             try:
                 generated_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                self._json(500, {"error": f"Could not create generated image folder: {exc}"})
+                _record_system_error("POST /api/image output directory", exc)
+                self._json(500, {"error": "Images cannot be saved right now. Please try again shortly."})
                 return
 
             output_stem = generated_dir / f"{random.randrange(1, 2**63):016x}"
@@ -2523,22 +2721,22 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     output_stem.with_suffix(image_suffix).unlink(missing_ok=True)
                 try:
                     output_path, content_type = ai_horde_image(prompt, output_path, seed)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_system_error("POST /api/image AI Horde", exc)
 
             if not content_type:
                 for image_suffix in (".jpg", ".png", ".webp", ".download"):
                     output_stem.with_suffix(image_suffix).unlink(missing_ok=True)
                 try:
                     output_path, content_type = pollinations_image(prompt, output_stem, seed)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_system_error("POST /api/image Pollinations", exc)
 
             if not content_type:
                 try:
                     output_path, content_type = search_image_fallback(original_prompt, output_stem)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_system_error("POST /api/image Commons/DDG", exc)
 
             if not content_type and hf_token:
                 try:
@@ -2553,8 +2751,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                         generated_image = generated_image.convert("RGB")
                     generated_image.save(output_path, format="PNG" if has_alpha else "JPEG", **({} if has_alpha else {"quality": 92}))
                     content_type = valid_image_file(output_path)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_system_error("POST /api/image Hugging Face", exc)
 
             if not content_type:
                 for image_suffix in (".jpg", ".png", ".webp", ".download"):
@@ -2563,7 +2761,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     output_path, content_type = local_image_fallback(prompt, output_stem)
                     local_fallback_used = True
                 except Exception as exc:
-                    self._json(500, {"error": f"Image generation and local fallback failed: {exc}"})
+                    _record_system_error("POST /api/image", exc)
+                    self._json(503, {"error": "The image could not be prepared right now. Please try again shortly."})
                     return
 
             extension = ".png" if content_type == "image/png" else ".jpg"
@@ -2576,7 +2775,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     if leftover != final_path:
                         leftover.unlink(missing_ok=True)
             except OSError as exc:
-                self._json(500, {"error": f"Could not save generated image: {exc}"})
+                _record_system_error("POST /api/image save", exc)
+                self._json(500, {"error": "The generated image could not be saved. Please try again shortly."})
                 return
             self._json(200, {"url": f"/generated/{final_path.name}", "message": "Here is a fresh local visual variation for your prompt." if local_fallback_used else "Here is your image."})
             return
@@ -2718,7 +2918,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                             for page in pages
                         ))
                     context = "\n\n".join(context_parts)
-                except Exception:
+                except Exception as exc:
+                    _record_system_error("POST /api/chat live search", exc)
                     context = f"Live web search was unavailable on {current_date}; state uncertainty about current facts."
                 if messages and messages[0].get("role") == "system":
                     messages[0]["content"] = str(messages[0].get("content", "")) + "\n\n" + context
@@ -2809,6 +3010,8 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                         last_retryable_error = exc
                         continue
                 if upstream is None:
+                    if last_retryable_error:
+                        _record_system_error("POST /api/chat OpenRouter providers", last_retryable_error)
                     print(f"All OpenRouter models failed; trying local Ollama: {last_retryable_error}")
                     if self._try_local_chat_fallback(messages, emit_assistant_response):
                         return
@@ -2858,6 +3061,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(b'{"message":{"content":""},"done":true}\n')
                     self.wfile.flush()
                 except (HTTPError, URLError, TimeoutError, socket.timeout, OSError) as exc:
+                    _record_system_error("POST /api/chat OpenRouter stream", exc)
                     print(f"OpenRouter stream ended; trying local fallback: {exc}")
                     if not self._try_local_chat_fallback(messages, emit_assistant_response):
                         emit_assistant_response(fallback_search_answer(user_prompt))
@@ -2939,6 +3143,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self.wfile.flush()
             upstream.close()
         except HTTPError as exc:
+            _record_system_error("POST /api/chat", exc)
             if stream_started:
                 emit_assistant_response(fallback_search_answer(user_prompt))
             else:
@@ -2949,9 +3154,12 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(detail)
         except TimeoutError as exc:
+            _record_system_error("POST /api/chat timeout", exc)
             if stream_started:
                 emit_assistant_response(fallback_search_answer(user_prompt))
         except (URLError, BrokenPipeError, ConnectionResetError, OSError) as exc:
+            if not isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                _record_system_error("POST /api/chat network", exc)
             if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
                 return
             error = {"error": f"Could not reach Ollama at {OLLAMA_URL}: {exc}"}
@@ -2960,11 +3168,12 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             else:
                 self._json(502, error)
         except Exception as exc:
+            _record_system_error("POST /api/chat", exc)
             if stream_started:
                 print(f"Chat request failed; returning search fallback: {exc}")
                 emit_assistant_response(fallback_search_answer(user_prompt))
             else:
-                self._json(500, {"error": f"Chat request failed: {exc}"})
+                self._json(500, {"error": "The chat request could not be completed. Please retry shortly."})
 
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
