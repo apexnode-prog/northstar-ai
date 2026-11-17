@@ -1781,6 +1781,45 @@ def _validate_source_texts(server_source, html_source, working_dir=None):
 def _validate_server_sources():
     return _validate_source_texts((ROOT / "server.py").read_text("utf-8"), (ROOT / "index.html").read_text("utf-8"), ROOT)
 
+
+def _live_code_audit():
+    result = {"python": {"ok": False, "details": "not checked"}, "html": {"ok": False, "details": "not checked"}, "javascript": {"ok": False, "details": "not checked"}}
+    try:
+        server_source = (ROOT / "server.py").read_text("utf-8")
+        ast.parse(server_source, filename="server.py")
+        result["python"] = {"ok": True, "details": "ast.parse passed"}
+    except Exception as exc:
+        result["python"] = {"ok": False, "details": str(exc)}
+    try:
+        html_source = (ROOT / "index.html").read_text("utf-8")
+        parser = _HTMLBalanceChecker()
+        parser.feed(html_source)
+        parser.close()
+        if parser.errors or parser.stack:
+            raise RuntimeError("; ".join(parser.errors or parser.stack[-5:]))
+        result["html"] = {"ok": True, "details": "HTML structure is balanced"}
+    except Exception as exc:
+        result["html"] = {"ok": False, "details": str(exc)}
+        html_source = ""
+    try:
+        scripts = re.findall(r"<script(?:\s[^>]*)?>([\s\S]*?)</script>", html_source, re.I)
+        node = shutil.which("node")
+        if not node:
+            raise RuntimeError("Node.js is unavailable; JavaScript syntax was not checked")
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".js", delete=False) as handle:
+            handle.write("\n".join(scripts))
+            temp_path = Path(handle.name)
+        try:
+            check = subprocess.run([node, "--check", str(temp_path)], capture_output=True, text=True, timeout=8)
+            if check.returncode:
+                raise RuntimeError((check.stderr or check.stdout or "JavaScript syntax error").strip()[:1800])
+            result["javascript"] = {"ok": True, "details": "Node --check passed"}
+        finally:
+            temp_path.unlink(missing_ok=True)
+    except Exception as exc:
+        result["javascript"] = {"ok": False, "details": str(exc)}
+    return result
+
 class NorthstarHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -1925,6 +1964,22 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
 
     def _handle_get(self):
         route = self.path.split("?", 1)[0]
+        if route == "/api/admin/file":
+            if not self._is_admin_session():
+                self._json(403, {"error": "Admin authentication is required."})
+                return
+            name = parse_qs(urlparse(self.path).query).get("name", [""])[0]
+            if name not in ("server.py", "index.html"):
+                self._json(400, {"error": "Choose server.py or index.html."})
+                return
+            try:
+                content = (ROOT / name).read_text("utf-8")
+                backups = sorted(path.name for path in ROOT.glob(f"{name}.*.bak"))[-50:]
+                self._json(200, {"name": name, "content": content, "backups": backups})
+            except OSError as exc:
+                _record_system_error("GET /api/admin/file", exc)
+                self._json(500, {"error": "The requested source file could not be read."})
+            return
         if route in ("/api/admin/telemetry", "/api/admin/diagnostics"):
             if not self._is_admin_session():
                 self._json(403, {"error": "Admin authentication is required."})
@@ -2019,6 +2074,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 "uptime_seconds": max(0, int(time.time() - SERVER_STARTED_AT)),
                 "recent_logs": logs or ["No server.log file is present; runtime output is managed by the process supervisor."],
                 "live_stats": {"online_users": online_users, "active_devices": devices, "active_device_count": len(devices)},
+                "code_audit": _live_code_audit(),
                 "service_status": {"openrouter": openrouter_status, "supabase": supabase_status, "huggingface_token_configured": bool(HF_TOKEN)},
                 "account_payment_stats": {"verified_users_local": user_count, "redeemed_txids_local": payment_count,
                                            "verified_users_supabase": remote_user_count, "redeemed_txids_supabase": remote_payment_count},
@@ -2095,7 +2151,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             _record_system_error("POST /api/admin/self-edit validation", exc)
             self._json(422, {"applied": False, "error": "The proposed patch failed pre-write validation."})
             return
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backups = {}
         try:
             for name, content in sources.items():
@@ -2331,6 +2387,48 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 self._json(403, {"error": "Admin authentication is required."})
                 return
             self._json(200, self._admin_diagnostics())
+            return
+
+        if route in ("/api/admin/save-file", "/api/admin/restore-backup"):
+            if not self._is_admin_session():
+                self._json(403, {"error": "Admin authentication is required."})
+                return
+            name = str(payload.get("name", ""))
+            if name not in ("server.py", "index.html"):
+                self._json(400, {"saved": False, "error": "Choose server.py or index.html."})
+                return
+            target = ROOT / name
+            try:
+                current_sources = {file_name: (ROOT / file_name).read_text("utf-8") for file_name in ("server.py", "index.html")}
+                if route == "/api/admin/save-file":
+                    replacement = payload.get("content")
+                    if not isinstance(replacement, str) or len(replacement.encode("utf-8")) > 500_000:
+                        self._json(400, {"saved": False, "error": "Source content is missing or exceeds 500 KB."})
+                        return
+                else:
+                    backup_name = str(payload.get("backup", ""))
+                    if not backup_name.startswith(name + ".") or not backup_name.endswith(".bak") or Path(backup_name).name != backup_name:
+                        self._json(400, {"restored": False, "error": "Choose a valid backup for the selected file."})
+                        return
+                    backup_path = (ROOT / backup_name).resolve()
+                    backup_path.relative_to(ROOT.resolve())
+                    replacement = backup_path.read_text("utf-8")
+                candidate = dict(current_sources)
+                candidate[name] = replacement
+                _validate_source_texts(candidate["server.py"], candidate["index.html"], ROOT)
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                current_backup = ROOT / f"{name}.{stamp}.bak"
+                current_backup.write_text(current_sources[name], encoding="utf-8")
+                temp_path = ROOT / f".{name}.{secrets.token_hex(6)}.tmp"
+                temp_path.write_text(replacement, encoding="utf-8")
+                temp_path.replace(target)
+                if route == "/api/admin/save-file":
+                    self._json(200, {"saved": True, "name": name, "backup": current_backup.name, "restart_required": name == "server.py"})
+                else:
+                    self._json(200, {"restored": True, "name": name, "backup": current_backup.name, "restored_from": str(payload.get("backup"))})
+            except Exception as exc:
+                _record_system_error(f"POST {route}", exc)
+                self._json(422, {"saved": False, "restored": False, "error": "The file change failed validation or could not be saved."})
             return
 
         if route == "/api/admin/self-edit":
@@ -2822,6 +2920,10 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
+            def chat_fallback_answer():
+                if self._is_admin_session() and re.search(r"\b(?:code|error|errors|issue|issues|bug|bugs|diagnostics|status|users|alter|edit|fix|feature|update)\b", user_prompt, re.I):
+                    return "Admin live diagnostics and code audit:\n" + json.dumps(self._admin_diagnostics(), ensure_ascii=False, indent=2)
+                return fallback_search_answer(user_prompt)
             self.wfile.write(b'{"status":"thinking"}\n')
             self.wfile.flush()
             for message in messages:
@@ -2862,8 +2964,9 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 live_answer = re.sub(r"^\[LIVE CLOCK & LOCATION: |\]$", "", live_clock)
                 emit_assistant_response(f"It’s {live_answer}.")
                 return
+            admin_site_query = bool(is_admin_request and re.search(r"\b(?:code|error|errors|issue|issues|bug|bugs|diagnostics|status|users|alter|edit|fix|feature|update)\b", user_prompt, re.I))
             if is_admin_request:
-                dated_system_prompt += "\n[ADMIN SYSTEM DIAGNOSTICS]\n" + json.dumps(self._admin_diagnostics(), ensure_ascii=False) + "\nFor this Admin only, answer questions about site health, logs, code, errors, and feature changes thoroughly and accurately. Never expose these diagnostics, internal code, secrets, or operational details to regular users."
+                dated_system_prompt += "\n[ADMIN LIVE DIAGNOSTICS & CODE AUDIT]\n" + json.dumps(self._admin_diagnostics(), ensure_ascii=False) + "\nFor this Admin session, use live diagnostics and real Python/HTML/JavaScript syntax checks to answer site health, logs, code, errors, and feature questions accurately. Never expose these diagnostics to regular users."
             else:
                 dated_system_prompt += "\nDo not disclose internal Northstar site diagnostics, private logs, account/payment records, credentials, or implementation details. You may answer general programming questions, but do not claim access to private site operations."
             corrections = _matching_global_corrections(user_prompt)
@@ -2887,7 +2990,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 messages[0]["content"] = dated_system_prompt + "\n\n" + str(messages[0].get("content", ""))
             else:
                 messages.insert(0, {"role": "system", "content": dated_system_prompt})
-            if should_search_web(user_prompt, payload.get("web_search", True)):
+            if should_search_web(user_prompt, payload.get("web_search", True)) and not admin_site_query:
                 query = re.split(r"\n\s*\[Attached document:", user_prompt, maxsplit=1)[0].strip()
                 if not query:
                     query = str(payload.get("search_query", "")).strip()
@@ -3015,7 +3118,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     print(f"All OpenRouter models failed; trying local Ollama: {last_retryable_error}")
                     if self._try_local_chat_fallback(messages, emit_assistant_response):
                         return
-                    emit_assistant_response(fallback_search_answer(user_prompt))
+                    emit_assistant_response(chat_fallback_answer())
                     return
 
                 if not stream_requested:
@@ -3064,7 +3167,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                     _record_system_error("POST /api/chat OpenRouter stream", exc)
                     print(f"OpenRouter stream ended; trying local fallback: {exc}")
                     if not self._try_local_chat_fallback(messages, emit_assistant_response):
-                        emit_assistant_response(fallback_search_answer(user_prompt))
+                        emit_assistant_response(chat_fallback_answer())
                 finally:
                     upstream.close()
                 return
@@ -3075,13 +3178,13 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 vision = next((candidate for candidate in ("moondream", "llava", "minicpm-v", "llama3.2-vision")
                                if any(name == candidate or name.startswith(candidate + ":") for name in names)), None)
                 if not vision:
-                    emit_assistant_response(fallback_search_answer(user_prompt))
+                    emit_assistant_response(chat_fallback_answer())
                     return
                 payload["model"] = next(m["name"] for m in available if m.get("name", "").lower().startswith(vision))
             available = self._ollama_models()
             available_names = [str(model.get("name", "")).strip() for model in available]
             if not available_names:
-                emit_assistant_response(fallback_search_answer(user_prompt))
+                emit_assistant_response(chat_fallback_answer())
                 return
             requested_model = str(payload.get("model", "")).strip()
             requested_base, _, requested_tag = requested_model.lower().partition(":")
@@ -3112,9 +3215,9 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
             except (URLError, TimeoutError, socket.timeout) as exc:
                 reason = getattr(exc, "reason", exc)
                 if isinstance(reason, (TimeoutError, socket.timeout)):
-                    emit_assistant_response(fallback_search_answer(user_prompt))
+                    emit_assistant_response(chat_fallback_answer())
                 else:
-                    emit_assistant_response(fallback_search_answer(user_prompt))
+                    emit_assistant_response(chat_fallback_answer())
                 return
             if not stream_requested:
                 try:
@@ -3145,7 +3248,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         except HTTPError as exc:
             _record_system_error("POST /api/chat", exc)
             if stream_started:
-                emit_assistant_response(fallback_search_answer(user_prompt))
+                emit_assistant_response(chat_fallback_answer())
             else:
                 detail = exc.read()
                 self.send_response(exc.code)
@@ -3156,7 +3259,7 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
         except TimeoutError as exc:
             _record_system_error("POST /api/chat timeout", exc)
             if stream_started:
-                emit_assistant_response(fallback_search_answer(user_prompt))
+                emit_assistant_response(chat_fallback_answer())
         except (URLError, BrokenPipeError, ConnectionResetError, OSError) as exc:
             if not isinstance(exc, (BrokenPipeError, ConnectionResetError)):
                 _record_system_error("POST /api/chat network", exc)
@@ -3164,14 +3267,14 @@ class NorthstarHandler(SimpleHTTPRequestHandler):
                 return
             error = {"error": f"Could not reach Ollama at {OLLAMA_URL}: {exc}"}
             if stream_started:
-                emit_assistant_response(fallback_search_answer(user_prompt))
+                emit_assistant_response(chat_fallback_answer())
             else:
                 self._json(502, error)
         except Exception as exc:
             _record_system_error("POST /api/chat", exc)
             if stream_started:
                 print(f"Chat request failed; returning search fallback: {exc}")
-                emit_assistant_response(fallback_search_answer(user_prompt))
+                emit_assistant_response(chat_fallback_answer())
             else:
                 self._json(500, {"error": "The chat request could not be completed. Please retry shortly."})
 
